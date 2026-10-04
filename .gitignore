@@ -1,0 +1,8 @@
+.gradle/
+build/
+.idea/
+.kotlin/
+*.iml
+.DS_Store
+# Takes are derived from service audio — they never enter the repository.
+*.take
