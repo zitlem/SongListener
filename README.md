@@ -47,6 +47,12 @@ Java on macOS can lose keyboard focus after you switch to another app and click 
 `ui/FocusWedgeFix.kt` repairs that on your first click. If typing ever goes dead anyway, click
 once more inside the window.
 
+## Web UI
+While the app runs it also serves a read-only page with the same three columns (Hearing,
+Accuracy, Learned songs) at `http://<this machine>:8780`, refreshed every second. It has no
+buttons, so anyone on the network can watch but not change anything. If the port is taken the
+web page is skipped and the app starts as usual.
+
 ## Running it on a service
 1. **Before:**
    - Start ChurchPresenter.

@@ -53,6 +53,7 @@ import songlistener.io.ServiceReport
 import kotlinx.coroutines.delay
 import java.awt.Desktop
 import java.io.File
+import songlistener.io.WebUi
 import java.text.SimpleDateFormat
 import java.util.Date
 
@@ -63,7 +64,9 @@ private val config = Config()
 fun main() {
     // Made before the window reads the settings file, so its Connect save keeps the id.
     val engine = ListenerEngine(dataDir, config, deviceId = AppSettings.deviceId(settingsFile))
-    Runtime.getRuntime().addShutdownHook(Thread { engine.shutdown() })
+    // Read-only browser view of the same three columns, at http://<this machine>:8780
+    val web = WebUi(engine, config).also { it.start() }
+    Runtime.getRuntime().addShutdownHook(Thread { engine.shutdown(); web.stop() })
     // Once addresses have been saved by Connect, connect at launch so it can be left running (or
     // started at login) and pick up whenever ChurchPresenter and STT come up.
     if (settingsFile.exists()) {
