@@ -133,7 +133,8 @@ class Recognizer(
             resetStreak()
             wrongKey = null; wrongStreak = 0
             if (state.wrongSlide != null) onEvent(RecognizerEvent.WrongSlideCleared(state.wrongSlide!!.shown, null))
-            state = state.copy(wrongSlide = null, cantCheckLive = false)
+            hintKey = null; hintStreak = 0
+            state = state.copy(wrongSlide = null, cantCheckLive = false, hint = null, lastSuggestion = null, lastMatch = null)
         } else if (song != null && song.section != null && song.section != previous?.section) {
             recordingMarks += SectionMark(recording.size, song.section)
             onEvent(RecognizerEvent.SectionChanged(song))
@@ -174,6 +175,13 @@ class Recognizer(
                 onEvent(RecognizerEvent.LookbackCleared(seconds(lookback.size)))
                 lookback.clear()
                 musicSince = null
+            }
+            // Long silence: what the panel last heard is stale.
+            if (samplesWithoutMusic > config.lookbackMaxGapSeconds * config.sampleRate &&
+                (state.hint != null || state.lastSuggestion != null || state.lastMatch != null)
+            ) {
+                hintKey = null; hintStreak = 0
+                state = state.copy(hint = null, lastSuggestion = null, lastMatch = null)
             }
             publishCounts(state.liveSong)
             return
