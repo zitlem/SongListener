@@ -2,6 +2,7 @@ package songlistener.io
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
@@ -48,6 +49,9 @@ object ServiceReport {
     }
 
     internal class SongOnScreen(val key: String, val label: String, val span: Span)
+
+    /** From this build on, a `late_slide` line without `heardBefore` means the song wasn't learned. */
+    private val HEARD_BEFORE_SINCE: LocalDateTime = LocalDateTime.of(2026, 10, 6, 0, 0)
 
     private val TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
     private val CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss")
@@ -249,6 +253,10 @@ object ServiceReport {
         val hintLead: Double?,
         val suggestionLead: Double?,
         val showClicked: String?,
+        /** Whether the music before the slide was this song; null when unknown (not learned, or an older log). */
+        val heardBefore: Boolean? = null,
+        /** The log says the song hadn't been learned, so it couldn't have been recognised. */
+        val unlearned: Boolean = false,
     )
 
     /**
@@ -262,7 +270,10 @@ object ServiceReport {
             val late = e.num("lateSeconds") ?: 0.0
             val key = e.str("key").orEmpty()
             Late(key, songName(e), e.time.minusSeconds(late.toLong()), e.time, late,
-                e.num("hintLeadSeconds"), e.num("suggestionLeadSeconds"), showsBetween(evs, key, e.time.minusSeconds(late.toLong()), e.time))
+                e.num("hintLeadSeconds"), e.num("suggestionLeadSeconds"), showsBetween(evs, key, e.time.minusSeconds(late.toLong()), e.time),
+                heardBefore = e.o["heardBefore"]?.jsonPrimitive?.booleanOrNull,
+                // Newer lines always say heardBefore when the song had been learned.
+                unlearned = e.o.containsKey("caught") && !e.o.containsKey("heardBefore") && e.time.isAfter(HEARD_BEFORE_SINCE))
         }
         return songs.mapNotNull { s ->
             val before = evs.filter { it.time.isBefore(s.span.start) || it.time == s.span.start }
@@ -295,13 +306,20 @@ object ServiceReport {
         val sb = StringBuilder("<div class=card><h2>Late slides</h2>")
         if (late.isEmpty()) return sb.append("<p class=muted>No slide went up 20 s or more after its music.</p></div>").toString()
         sb.append("<table><thead><tr><th>Slide up</th><th>Song</th><th class=n>Music before the slide</th><th>Early guess</th><th>Suggestion</th><th>Show it</th></tr></thead><tbody>")
-        fun lead(v: Double?) = v?.let { "<span class=ok>${fmtSec(it)} before</span>" } ?: "<span class=warn>missed</span>"
+        fun lead(l: Late, v: Double?) = when {
+            v != null -> "<span class=ok>${fmtSec(v)} before</span>"
+            l.heardBefore == false -> "<span class=muted>other music played first</span>"
+            l.unlearned -> "<span class=muted>not learned yet</span>"
+            else -> "<span class=warn>missed</span>"
+        }
         for (l in late) {
             sb.append("<tr><td>${l.slideUp.format(CLOCK)}</td><td>${esc(l.label)}</td><td class=n>${fmtSec(l.lateSeconds)}</td>")
-            sb.append("<td>${lead(l.hintLead)}</td><td>${lead(l.suggestionLead)}</td><td>${l.showClicked?.let(::esc) ?: "<span class=muted>—</span>"}</td></tr>")
+            sb.append("<td>${lead(l, l.hintLead)}</td><td>${lead(l, l.suggestionLead)}</td><td>${l.showClicked?.let(::esc) ?: "<span class=muted>—</span>"}</td></tr>")
         }
         val caught = late.count { it.hintLead != null || it.suggestionLead != null }
-        sb.append("</tbody></table><p class=muted>Named before the slide: $caught of ${late.size}.</p></div>")
+        val couldHave = late.count { it.hintLead != null || it.suggestionLead != null || (it.heardBefore != false && !it.unlearned) }
+        sb.append("</tbody></table><p class=muted>Named before the slide: $caught of $couldHave that could have been " +
+            "(${late.size} late in all; the rest had other music before the slide, or weren't learned yet).</p></div>")
         return sb.toString()
     }
 

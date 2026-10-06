@@ -25,7 +25,7 @@ fun main() {
     println("Replaying ${clips.size} recording(s)" + (originFilter?.let { " ($it only)" } ?: "") + ": " +
         "quick ${config.queryFrames / config.featuresPerSecond}s ≥${config.suggestScore}, " +
         "steady ${config.steadyFrames / config.featuresPerSecond}s ≥${config.steadyScore}, " +
-        "wrong-slide margin ${config.wrongSlideMargin}, feature=${config.feature}, transpose=${config.transpose}")
+        "wrong-slide margin ${config.wrongSlideMargin} min ${config.wrongSlideMinScore}, cohort=${config.cohort}, feature=${config.feature}, transpose=${config.transpose}")
     val (rows, s) = Replay.run(clips, config)
 
     println()
@@ -82,6 +82,8 @@ private fun overrides(c: Config): Config {
         steadyScore = prop("steadyScore")?.toDouble() ?: c.steadyScore,
         steadyMargin = prop("steadyMargin")?.toDouble() ?: c.steadyMargin,
         wrongSlideMargin = prop("wrongSlideMargin")?.toDouble() ?: c.wrongSlideMargin,
+        wrongSlideMinScore = prop("wrongSlideMinScore")?.toDouble() ?: c.wrongSlideMinScore,
+        cohort = prop("cohort")?.toBoolean() ?: c.cohort,
         framesPerFeature = prop("framesPerFeature")?.toInt() ?: c.framesPerFeature,
     )
 }

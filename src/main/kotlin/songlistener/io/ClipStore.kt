@@ -58,6 +58,36 @@ class ClipStore(private val dir: File) {
         runCatching { wav to Clip(readWav(wav), labels) }.getOrNull()
     }
 
+    /** Rewrites a recording's labels; renames its files when the song changed. Returns the new `.wav`. */
+    fun update(wav: File, labels: ClipLabels): File {
+        val oldJson = File(dir, wav.name.removeSuffix(".wav") + ".json")
+        val stored = json.decodeFromString(ClipLabels.serializer(), oldJson.readText())
+        val target = if (stored.songKey == labels.songKey) wav else File(dir, uniqueBase(baseName(labels)) + ".wav")
+        if (target != wav) {
+            wav.renameTo(target)
+            oldJson.delete()
+        }
+        writeAtomically(File(dir, target.name.removeSuffix(".wav") + ".json")) {
+            it.writeText(json.encodeToString(ClipLabels.serializer(), labels))
+        }
+        return target
+    }
+
+    /**
+     * Removes one recording by moving it to a `deleted` folder beside this one, so a mistaken
+     * delete (the review page is open to the whole network) can be undone by moving it back.
+     */
+    fun deleteOne(wav: File) {
+        val trash = File(dir.parentFile, "deleted").also { it.mkdirs() }
+        listOf(wav, File(dir, wav.name.removeSuffix(".wav") + ".json")).forEach { f ->
+            if (f.exists() && !f.renameTo(File(trash, f.name))) f.delete()
+        }
+    }
+
+    /** The recording file named [name] (with or without `.wav`), if it exists here. */
+    fun find(name: String): File? =
+        File(dir, name.removeSuffix(".wav") + ".wav").takeIf { it.exists() && it.parentFile == dir }
+
     fun delete(songKey: String) {
         labels().filter { it.second.songKey == songKey }.forEach { (wav, _) ->
             wav.delete()

@@ -60,6 +60,16 @@ data class Config(
     val steadyMargin: Double = 0.05,
     /** How far another song must beat the one on screen, over the steady window, to warn of a wrong slide. */
     val wrongSlideMargin: Double = 0.06,
+    /**
+     * The song the music sounds like must itself score at least this before a wrong-slide warning:
+     * all three of 2026-10-04's false alarms were rivals at 0.53–0.60, beating a poorly matching slide.
+     */
+    val wrongSlideMinScore: Double = 0.64,
+    /**
+     * Score each song relative to how it scores on other songs' recordings (cohort normalisation),
+     * so songs with generic harmony stop winning by default. Off until replay shows it helps.
+     */
+    val cohort: Boolean = false,
     /** Consecutive steady runs that must agree before a wrong-slide warning shows. */
     val wrongSlideStreak: Int = 2,
     /** Consecutive matcher runs the same song must win before it is suggested. */

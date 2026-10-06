@@ -1,6 +1,7 @@
 package songlistener.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -45,6 +46,7 @@ import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import songlistener.core.Config
 import songlistener.core.RecognizerState
+import songlistener.core.slideCheck
 import songlistener.core.SectionMark
 import songlistener.io.AppSettings
 import songlistener.io.LearnedSong
@@ -61,11 +63,14 @@ private val dataDir = File(System.getProperty("user.home"), ".songlistener")
 private val settingsFile = File(dataDir, "config.json")
 private val config = Config()
 
+/** The review window is open. */
+private var reviewOpen by mutableStateOf(false)
+
 fun main() {
     // Made before the window reads the settings file, so its Connect save keeps the id.
     val engine = ListenerEngine(dataDir, config, deviceId = AppSettings.deviceId(settingsFile))
     // Read-only browser view of the same three columns, at http://<this machine>:8780
-    val web = WebUi(engine, config).also { it.start() }
+    val web = WebUi(engine, config, AppSettings.load(settingsFile).webPort).also { it.start() }
     Runtime.getRuntime().addShutdownHook(Thread { engine.shutdown(); web.stop() })
     // Once addresses have been saved by Connect, connect at launch so it can be left running (or
     // started at login) and pick up whenever ChurchPresenter and STT come up.
@@ -74,6 +79,7 @@ fun main() {
         engine.connect(saved.churchPresenterUrl, saved.apiKey, saved.sttUrl)
     }
     application {
+        if (reviewOpen) ReviewWindow(engine, web.reviewUrls().first()) { reviewOpen = false }
         Window(
             onCloseRequest = { engine.shutdown(); exitApplication() },
             title = "SongListener",
@@ -88,7 +94,7 @@ fun main() {
             }
             MaterialTheme(colorScheme = darkColorScheme()) {
                 FocusWedgeFix {
-                    Surface(Modifier.fillMaxSize()) { App(engine) }
+                    Surface(Modifier.fillMaxSize()) { App(engine, web) }
                 }
             }
         }
@@ -96,17 +102,16 @@ fun main() {
 }
 
 @Composable
-private fun App(engine: ListenerEngine) {
+private fun App(engine: ListenerEngine, web: WebUi) {
     val state by engine.state.collectAsState()
     val library by engine.library.collectAsState()
     val clips by engine.clipStats.collectAsState()
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         ConnectionBar(engine)
         WrongSlideBanner(engine, state)
-        StatusRow(engine, state)
+        StatusRow(engine, state, web)
         Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Panel("Hearing", Modifier.weight(1f)) { Hearing(engine, state) }
-            Panel("Accuracy (while a learned song is live)", Modifier.weight(1f)) { AccuracyPanel(state) }
             Panel("Learned songs", Modifier.weight(1f)) {
                 Text(
                     "Recordings: ${clips.imported} imported · ${clips.live} live · ${"%.0f".format(clips.bytes / 1_000_000.0)} MB",
@@ -129,7 +134,10 @@ private fun ConnectionBar(engine: ListenerEngine) {
         OutlinedTextField(settings.sttUrl, { settings = settings.copy(sttUrl = it) },
             label = { Text("STT server") }, singleLine = true, modifier = Modifier.weight(1f))
         Button(onClick = {
-            AppSettings.save(settingsFile, settings)
+            // Only its own fields: the rest (web port, device id) may have changed since this was loaded.
+            AppSettings.save(settingsFile, AppSettings.load(settingsFile).copy(
+                churchPresenterUrl = settings.churchPresenterUrl, apiKey = settings.apiKey, sttUrl = settings.sttUrl,
+            ))
             engine.connect(settings.churchPresenterUrl, settings.apiKey, settings.sttUrl)
         }) { Text("Connect") }
         TextButton(onClick = {
@@ -143,11 +151,12 @@ private fun ConnectionBar(engine: ListenerEngine) {
                 }
             }.start()
         }) { Text("Report") }
+        TextButton(onClick = { reviewOpen = true }) { Text("Review") }
     }
 }
 
 @Composable
-private fun StatusRow(engine: ListenerEngine, state: RecognizerState) {
+private fun StatusRow(engine: ListenerEngine, state: RecognizerState, web: WebUi) {
     val cpConnected by engine.churchPresenter.connected.collectAsState()
     val cpError by engine.churchPresenter.error.collectAsState()
     val sttConnected by engine.stt.connected.collectAsState()
@@ -155,6 +164,7 @@ private fun StatusRow(engine: ListenerEngine, state: RecognizerState) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Dot("ChurchPresenter", cpConnected, cpError)
+            WebRow(web)
             Row(horizontalArrangement = Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
                 Dot("STT audio", sttConnected, sttError)
                 Text("Music", style = MaterialTheme.typography.labelLarge)
@@ -171,6 +181,15 @@ private fun StatusRow(engine: ListenerEngine, state: RecognizerState) {
                 else "On screen: ${live.label}" + (live.section?.let { "  ·  section $it" } ?: ""),
                 style = MaterialTheme.typography.titleMedium,
             )
+            slideCheck(state, config)?.let { c ->
+                Text(
+                    "Slide check: ${c.text}",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = when (c.kind) {
+                        "ok" -> Color(0xFF81C784); "wrong" -> Color(0xFFE57373); "doubt" -> Color(0xFFFFD54F); else -> Color.Gray
+                    },
+                )
+            }
             if (live != null) {
                 val intro = (state.recordingIntroFrames / config.featuresPerSecond).toInt()
                 val secs = ((state.recordingFrames - state.recordingIntroFrames) / config.featuresPerSecond).toInt()
@@ -188,10 +207,45 @@ private fun StatusRow(engine: ListenerEngine, state: RecognizerState) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
             }
+            val a = state.accuracy
             Text(
-                "Query window: ${state.queryFrames}/${config.queryFrames} frames",
+                "Query window: ${state.queryFrames}/${config.queryFrames} frames" +
+                    if (a.runs > 0) "  ·  Slide checks this session: ${a.top1} of ${a.runs} matched" else "",
                 style = MaterialTheme.typography.bodySmall,
             )
+        }
+    }
+}
+
+/** The web page's address (click to open), and its port, which can be changed here. */
+@Composable
+private fun WebRow(web: WebUi) {
+    val running by web.running.collectAsState()
+    val error by web.error.collectAsState()
+    var port by remember { mutableStateOf(web.port.toString()) }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Dot("Web page", running, error)
+        if (running) {
+            val url = web.urls().first()
+            Text(
+                url, color = Color(0xFF9ECBFF), style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.clickable { runCatching { Desktop.getDesktop().browse(java.net.URI(url)) } },
+            )
+        }
+        Text("Port", style = MaterialTheme.typography.labelLarge)
+        OutlinedTextField(
+            port, { port = it.filter(Char::isDigit).take(5) }, singleLine = true,
+            modifier = Modifier.width(96.dp), textStyle = MaterialTheme.typography.bodyMedium,
+        )
+        val wanted = port.toIntOrNull()
+        val valid = wanted != null && wanted in 1024..65535
+        if (valid && (wanted != web.port || !running)) {
+            TextButton(onClick = {
+                Thread { web.restart(wanted!!) }.start()
+                AppSettings.save(settingsFile, AppSettings.load(settingsFile).copy(webPort = wanted!!))
+            }) { Text(if (wanted == web.port) "Retry" else "Use port $wanted") }
+        } else if (!valid) {
+            Text("1024–65535", color = Color(0xFFE57373), style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -317,27 +371,6 @@ private fun ShowButtons(engine: ListenerEngine, songKey: String, label: String =
             status == "declined" -> Text("Declined in ChurchPresenter", color = Color(0xFFE57373))
             status?.startsWith("failed") == true -> Text(status.removePrefix("failed: "), color = Color(0xFFE57373), style = MaterialTheme.typography.bodySmall)
         }
-    }
-}
-
-@Composable
-private fun AccuracyPanel(state: RecognizerState) {
-    val a = state.accuracy
-    if (a.runs == 0) {
-        Text("Runs once a song that already has a learned take is on screen and music is playing.")
-        return
-    }
-    Text("Match runs: ${a.runs}")
-    Text("Top-1 correct: ${a.top1} (${pct(a.top1, a.runs)})")
-    Text("Confident: ${a.confident}, of which correct: ${a.confidentHits} (${pct(a.confidentHits, a.confident)})")
-    a.lastPrediction?.let { p ->
-        val hit = p.songKey == a.lastLiveKey
-        Spacer(Modifier.height(8.dp))
-        Text("Last prediction", style = MaterialTheme.typography.labelLarge)
-        Text(
-            "${p.songLabel}  %.2f  %s".format(p.score, if (hit) "✓" else "✗"),
-            color = if (hit) Color(0xFF81C784) else Color(0xFFE57373),
-        )
     }
 }
 

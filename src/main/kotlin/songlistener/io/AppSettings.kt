@@ -14,6 +14,8 @@ data class AppSettings(
      * per device whether to ask the operator before a "Show it", so it must not change per launch.
      */
     val deviceId: String = "",
+    /** The port the web page (phone / sound desk view and the review page) is served on. */
+    val webPort: Int = 8780,
 ) {
     companion object {
         private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }

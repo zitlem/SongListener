@@ -15,6 +15,9 @@ import songlistener.core.Clip
 import songlistener.core.ClipCutter
 import songlistener.core.LiveSong
 import songlistener.core.LyricsSnapshot
+import songlistener.core.ClipLabels
+import songlistener.core.ReviewCheck
+import songlistener.core.SongKeys
 import songlistener.core.WrongSlide
 import songlistener.core.Config
 import songlistener.core.Recognizer
@@ -22,6 +25,9 @@ import songlistener.core.RecognizerState
 import songlistener.core.SongTake
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+
+/** One recording in the review list: its file, labels, and — once checked — its flags. */
+data class ReviewItem(val name: String, val wav: File, val labels: ClipLabels, val check: ReviewCheck?)
 
 /** What the listener has learned about one song, for the library list. */
 data class LearnedSong(
@@ -214,6 +220,90 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
                 "${song.key} version=${saved.version} ${if (saved.changed) "new" else "unchanged"}" +
                     (fetched.songbook?.let { " songbook=$it" } ?: "") + if (fetched.songbookCertain) "" else " (songbook uncertain)",
             )
+        }
+    }
+
+    private val _reviews = MutableStateFlow<List<ReviewItem>>(emptyList())
+    /** Every recording, newest first, with its flags once checked. */
+    val reviews: StateFlow<List<ReviewItem>> = _reviews
+    private val _reviewChecking = MutableStateFlow(false)
+    val reviewChecking: StateFlow<Boolean> = _reviewChecking
+    private val reviewCache = java.util.concurrent.ConcurrentHashMap<String, ReviewCheck>()
+    private var reviewJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Rebuilds the review list and checks every recording in the background (about a second each).
+     * A check is kept until anything learned changes.
+     */
+    fun refreshReview() {
+        reviewJob?.cancel()
+        reviewJob = scope.launch(Dispatchers.Default) {
+            _reviewChecking.value = true
+            try {
+                val takes = store.loadAll()
+                val signature = takes.joinToString { "${it.songKey}@${it.recordedAt}" }.hashCode()
+                val items = clipStore.labels().reversed().map { (wav, l) -> ReviewItem(wav.nameWithoutExtension, wav, l, reviewCache["$signature/${wav.name}"]) }
+                _reviews.value = items
+                val matcher = songlistener.core.Matcher(config)
+                for (item in items) {
+                    if (item.check != null) continue
+                    val l = item.labels
+                    val take = takes.firstOrNull { it.songKey == l.songKey && it.recordedAt == l.takeRecordedAt }
+                    val uncertain = runCatching { lyricsStore.latest(l.songKey, l.songbook)?.songbookCertain == false }.getOrDefault(false)
+                    val check = songlistener.core.ReviewFlags.check(l, take, takes, matcher, config, uncertain)
+                    reviewCache["$signature/${item.wav.name}"] = check
+                    _reviews.value = _reviews.value.map { if (it.name == item.name) it.copy(check = check) else it }
+                }
+            } finally {
+                _reviewChecking.value = false
+            }
+        }
+    }
+
+    /** Songs a recording can be corrected to: everything learned, plus ChurchPresenter's library. */
+    suspend fun knownSongs(): List<Pair<String, String>> {
+        val learned = store.loadAll().map { it.songKey }
+        val catalog = runCatching { churchPresenter.catalogKeys() }.getOrDefault(emptyList())
+        return (learned + catalog).distinct().map { it to (SongKeys.labelOf(it) ?: it) }.sortedBy { it.second.lowercase() }
+    }
+
+    /** Someone listened: the song is right. */
+    fun markReviewed(name: String, from: String = "app") = correct(name, "recording_reviewed", from) { wav, l ->
+        clipStore.update(wav, l.copy(reviewed = true, reviewedAt = System.currentTimeMillis()))
+    }
+
+    /**
+     * The recording is of [songKey], not what it was labelled: relabel it, drop the take learned
+     * under the wrong song and learn it as the right one.
+     */
+    fun relabel(name: String, songKey: String, from: String = "app") = correct(name, "recording_relabelled to $songKey", from) { wav, l ->
+        if (songKey == l.songKey) return@correct
+        store.deleteTake(l.songKey, l.takeRecordedAt)
+        val fixed = l.copy(
+            songKey = songKey, songLabel = SongKeys.labelOf(songKey) ?: songKey, songbook = null, lyricsVersion = null,
+            relabelledFrom = l.relabelledFrom ?: l.songKey, reviewed = true, reviewedAt = System.currentTimeMillis(),
+        )
+        val moved = clipStore.update(wav, fixed)
+        songlistener.core.Replay.learn(Clip(ClipStore.readWav(moved), fixed), config)?.let { store.save(it) }
+    }
+
+    /** Deletes a recording and the take learned from it. */
+    fun deleteRecording(name: String, from: String = "app") = correct(name, "recording_deleted", from) { wav, l ->
+        store.deleteTake(l.songKey, l.takeRecordedAt)
+        clipStore.deleteOne(wav)
+    }
+
+    private fun correct(name: String, event: String, from: String, action: (File, ClipLabels) -> Unit) {
+        scope.launch {
+            val wav = clipStore.find(name) ?: return@launch
+            val labels = clipStore.labels().firstOrNull { it.first == wav }?.second ?: return@launch
+            withContext(Dispatchers.IO) { action(wav, labels) }
+            val (type, detail) = event.split(' ', limit = 2).let { it[0] to it.getOrNull(1) }
+            log.note(type, "$name was ${labels.songKey}" + (detail?.let { " $it" } ?: "") + " (from $from)")
+            recognizer.setTakes(store.loadAll())
+            refreshClipStats()
+            publish()
+            refreshReview()
         }
     }
 

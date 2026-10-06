@@ -37,6 +37,11 @@ class TakeStore(private val dir: File, private val maxTakesPerSong: Int) {
         prune(take.songKey)
     }
 
+    /** Deletes the one take of [songKey] recorded at [recordedAt]. */
+    fun deleteTake(songKey: String, recordedAt: Long) {
+        filesFor(songKey).filter { it.name == "${prefix(songKey)}$recordedAt$EXT" }.forEach { it.delete() }
+    }
+
     fun delete(songKey: String) {
         filesFor(songKey).forEach { it.delete() }
     }

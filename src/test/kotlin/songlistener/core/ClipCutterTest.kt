@@ -133,4 +133,19 @@ class ClipCutterTest {
         assertEquals(3.0, c.labels.goLiveSeconds)
         assertEquals(81.0, c.labels.endSeconds)     // 85 + 3 − 7: the whole song is in it
     }
+
+    @Test
+    fun `a long pause with the slide still up doesn't end the recording`() {
+        val rig = Rig()
+        rig.play(Synth.songC, 10.0, music = false)
+        rig.live(song)
+        rig.play(Synth.songA, 35.0, music = true)    // 10–45 s
+        rig.play(Synth.songC, 40.0, music = false)   // a 40 s prayer, slide still up
+        rig.play(Synth.songA, 35.0, music = true, start = 35.0) // 85–120 s: the song carries on
+        rig.live(null)
+        rig.play(Synth.songC, 4.0, music = false)
+        val c = clips.single()
+        assertEquals("off_screen", c.labels.endReason)
+        assertEquals(116.0, c.labels.endSeconds)     // 120 + 3 − 7: both halves of the song
+    }
 }

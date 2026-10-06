@@ -11,7 +11,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class ClipStoreTest {
-    private val dir = Files.createTempDirectory("clips").toFile()
+    private val dir = java.io.File(Files.createTempDirectory("songlistener").toFile(), "clips").also { it.mkdirs() }
     private val store = ClipStore(dir)
 
     private fun clip(key: String, label: String, at: Long) = Clip(
@@ -71,5 +71,21 @@ class ClipStoreTest {
     fun `old recordings from 2026-09-30 are marked as cut using SongListener's log`() {
         val sep30 = java.time.LocalDateTime.of(2026, 9, 30, 19, 1).atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
         assertEquals("songlistener_log", ClipStore.withDefaults(clip("1|A", "A", sep30).labels).importSource)
+    }
+
+    @Test
+    fun `a correction renames the recording, and a delete moves it aside`() {
+        val wav = store.save(clip("1071|Я хочу", "#1071 Я хочу", 1_790_000_000_000))
+        val moved = store.update(wav, store.labels().single().second.copy(songKey = "176|Радость", songLabel = "#176 Радость", relabelledFrom = "1071|Я хочу"))
+        assertTrue(moved.name.endsWith("_176.wav"), moved.name)
+        assertTrue(!wav.exists())
+        val l = store.labels().single().second
+        assertEquals("176|Радость", l.songKey)
+        assertEquals("1071|Я хочу", l.relabelledFrom)
+        assertEquals(moved, store.find(moved.nameWithoutExtension))
+
+        store.deleteOne(moved)
+        assertTrue(store.labels().isEmpty())
+        assertTrue(java.io.File(dir.parentFile, "deleted/${moved.name}").exists(), "kept in deleted/")
     }
 }

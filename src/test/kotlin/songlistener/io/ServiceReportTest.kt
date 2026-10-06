@@ -73,7 +73,7 @@ class ServiceReportTest {
         assertTrue("#5 Кистью Творца" in html)
         assertTrue("1m 30s" in html, "how late")
         assertTrue("40s before" in html, "the early guess's lead")
-        assertTrue("Named before the slide: 1 of 1" in html)
+        assertTrue("Named before the slide: 1 of 1 that could have been" in html)
         assertTrue("<h2>Wrong slides</h2>" in html)
         assertTrue("#93 Великий Бог" in html)
         assertTrue("0.55 vs 0.71" in html)
@@ -91,5 +91,23 @@ class ServiceReportTest {
         val late = ServiceReport.lateSlides(evs, ServiceReport.songsOnScreen(evs)).single()
         assertEquals(92.0, late.lateSeconds)
         assertEquals(null, late.hintLead)
+    }
+
+    @Test
+    fun `a late slide after other music, or of an unlearned song, isn't counted as missed`() {
+        val html = ServiceReport.render("2026-10-11", listOf(
+            """{"time":"2026-10-11 10:00:00","type":"app_started"}""",
+            """{"time":"2026-10-11 10:01:00","type":"music_started","musicProb":0.8}""",
+            """{"time":"2026-10-11 10:05:00","type":"song_live","song":"x","key":"426|Холм","section":0}""",
+            """{"time":"2026-10-11 10:05:00","type":"late_slide","song":"x","key":"426|Холм","lateSeconds":240.0,"caught":false,"heardBefore":false}""",
+            """{"time":"2026-10-11 10:09:00","type":"song_off_screen"}""",
+            """{"time":"2026-10-11 10:10:00","type":"music_started","musicProb":0.8}""",
+            """{"time":"2026-10-11 10:14:00","type":"song_live","song":"y","key":"2616|Новая","section":0}""",
+            """{"time":"2026-10-11 10:14:00","type":"late_slide","song":"y","key":"2616|Новая","lateSeconds":240.0,"caught":false}""",
+        ))
+        assertTrue("other music played first" in html)
+        assertTrue("not learned yet" in html)
+        assertTrue("missed" !in html.substringAfter("<h2>Late slides</h2>").substringBefore("</table>"))
+        assertTrue("Named before the slide: 0 of 0 that could have been (2 late in all" in html)
     }
 }

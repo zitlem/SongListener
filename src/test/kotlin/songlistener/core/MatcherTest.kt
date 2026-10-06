@@ -53,4 +53,25 @@ class MatcherTest {
         assertEquals(null, matcher.match(query(Synth.songA), emptyList()).best)
         assertEquals(null, matcher.match(emptyList(), takes).best)
     }
+
+    @Test
+    fun `cohort normalisation demotes a song that matches everything`() {
+        // G is generic: it contains A's, B's and D's music, so it matches anything perfectly.
+        val songD = listOf(Synth.Am, Synth.Em, Synth.F, Synth.C, Synth.Dm, Synth.Am, Synth.E, Synth.Am)
+        val a = Synth.take("A", Synth.songA)
+        val b = Synth.take("B", Synth.songB)
+        val d = Synth.take("D", songD)
+        val g = SongTake("G", "G", 0, a.frames + b.frames + d.frames, emptyList())
+        val takes = listOf(a, b, d, g)
+        val q = query(Synth.songA)
+
+        val raw = Matcher(Config(transpose = false)).match(q, takes)
+        val gRaw = raw.ranked.first { it.songKey == "G" }.score
+        val aRaw = raw.ranked.first { it.songKey == "A" }.score
+        assertTrue(kotlin.math.abs(gRaw - aRaw) < 0.03, "G ties A without cohort: $gRaw vs $aRaw")
+
+        val norm = Matcher(Config(transpose = false, cohort = true)).match(q, takes)
+        assertEquals("A", norm.best!!.songKey)
+        assertTrue(norm.margin > 0.1, "margin ${norm.margin}")
+    }
 }

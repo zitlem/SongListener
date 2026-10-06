@@ -50,7 +50,29 @@ data class RecognizerState(
     val wrongSlide: WrongSlide? = null,
     /** The song on screen has no takes yet, so whether it is the right one can't be checked. */
     val cantCheckLive: Boolean = false,
+    /** Seconds of music heard since the song on screen went up (the slide is judged after the steady window). */
+    val secondsSinceLive: Double = 0.0,
 )
+
+/** One line saying whether the music matches the song on screen. [kind] is `ok`, `doubt`, `wrong`, `wait` or `unknown`. */
+data class SlideCheck(val kind: String, val text: String)
+
+/**
+ * The slide check for [s]: null while nothing is on screen. Shared by the window and the web page
+ * so both say the same thing.
+ */
+fun slideCheck(s: RecognizerState, config: Config): SlideCheck? {
+    val live = s.liveSong ?: return null
+    val needed = config.steadyFrames / config.featuresPerSecond
+    s.wrongSlide?.let { return SlideCheck("wrong", "✗ sounds like ${it.heard.songLabel} (%.2f)".format(it.heard.score)) }
+    if (s.cantCheckLive) return SlideCheck("unknown", "can't check — ${live.label} hasn't been learned yet")
+    if (s.secondsSinceLive < needed || s.accuracy.lastLiveKey != live.key) {
+        return SlideCheck("wait", "checking… (%.0f of %.0f s of music heard)".format(minOf(s.secondsSinceLive, needed), needed))
+    }
+    val p = s.accuracy.lastPrediction ?: return SlideCheck("wait", "checking…")
+    return if (p.songKey == live.key) SlideCheck("ok", "✓ music matches (%.2f)".format(p.score))
+    else SlideCheck("doubt", "? best match right now is ${p.songLabel} (%.2f)".format(p.score))
+}
 
 /**
  * Learns takes while a song is live and suggests songs while none is. Driven entirely by the three
@@ -89,6 +111,11 @@ class Recognizer(
     private var streak = 0
     private var hintKey: String? = null
     private var hintStreak = 0
+    /**
+     * Stored frames of music heard since the song on screen went up. The steady window judges the
+     * slide only once it holds nothing from before, or it would judge the previous music.
+     */
+    private var framesSinceLive = 0
     private var wrongKey: String? = null
     private var wrongStreak = 0
     /**
@@ -102,6 +129,12 @@ class Recognizer(
         private set
 
     fun takesFor(songKey: String): List<SongTake> = takes[songKey].orEmpty()
+
+    /** Replaces everything learned, after a correction. */
+    fun setTakes(all: List<SongTake>) {
+        takes.clear()
+        all.groupBy { it.songKey }.forEach { (k, v) -> takes[k] = v.toMutableList() }
+    }
     fun allTakes(): List<SongTake> = takes.values.flatten()
 
     fun forget(songKey: String) {
@@ -118,6 +151,7 @@ class Recognizer(
             }
             onEvent(RecognizerEvent.LiveChanged(song))
             if (song != null && previous == null && lookback.isNotEmpty()) reportIfLate(song)
+            framesSinceLive = 0
             musicSince = null
             if (song != null) {
                 recordingKey = song
@@ -192,6 +226,7 @@ class Recognizer(
             while (query.size > maxOf(config.queryFrames, config.steadyFrames)) query.removeFirst()
             if (recordingKey != null) {
                 if (recording.size < config.maxTakeFrames) recording += frame.chroma
+                framesSinceLive++
             } else {
                 if (lookback.isEmpty()) {
                     musicSince = clock()
@@ -240,6 +275,7 @@ class Recognizer(
             recordingFrames = recording.size,
             recordingIntroFrames = recordingIntro,
             lookbackFrames = lookback.size,
+            secondsSinceLive = if (live == null) 0.0 else framesSinceLive / config.featuresPerSecond,
         )
     }
 
@@ -293,6 +329,9 @@ class Recognizer(
                 state = state.copy(cantCheckLive = true)
                 return "live_unlearned"
             }
+            // Until the window holds only music heard since the slide went up, it is still judging
+            // whatever played before — no accuracy, no wrong-slide check.
+            if (framesSinceLive < config.steadyFrames) return "settling"
             recordAccuracy(live.key, best, confident)
             checkSlide(live, result)
             return if (best.songKey == live.key) "accuracy_hit" else "accuracy_miss"
@@ -313,7 +352,8 @@ class Recognizer(
     private fun checkSlide(live: LiveSong, result: MatchResult) {
         val shownScore = result.ranked.firstOrNull { it.songKey == live.key }?.score ?: return
         val rival = result.ranked.firstOrNull { it.songKey != live.key }
-        val clear = rival == null || rival.score - shownScore < config.wrongSlideMargin
+        val clear = rival == null || rival.score - shownScore < config.wrongSlideMargin ||
+            rival.score < config.wrongSlideMinScore
         if (clear) {
             wrongKey = null; wrongStreak = 0
             state.wrongSlide?.let {
@@ -336,7 +376,14 @@ class Recognizer(
         if (late < config.lateSlideSeconds) return
         val now = clock()
         fun lead(s: Suggestion?) = s?.takeIf { it.songKey == song.key && it.at >= since }?.let { (now - it.at) / 1000.0 }
-        onEvent(RecognizerEvent.LateSlide(song, late, lead(state.hint), lead(state.lastSuggestion)))
+        // Was it this song that played before the slide, or other music (a prelude, another song)?
+        // Only knowable when the song has been learned.
+        val own = takes[song.key]
+        val heardBefore = own?.let {
+            val window = lookback.toList().takeLast(maxOf(config.queryFrames, config.steadyFrames))
+            (matcher.match(window, it).best?.score ?: 0.0) >= config.steadyScore
+        }
+        onEvent(RecognizerEvent.LateSlide(song, late, lead(state.hint), lead(state.lastSuggestion), heardBefore))
     }
 
     private fun seconds(frames: Int): Double = frames / config.featuresPerSecond

@@ -407,4 +407,68 @@ class RecognizerTest {
         assertEquals("2|B", late.song.key)
         assertFalse(late.caught)
     }
+
+    @Test
+    fun `the slide isn't judged until the window holds only music since it went up`() {
+        val r = twoListeners(listOf(Synth.take("1|A", Synth.songA), Synth.take("2|B", Synth.songB)))
+        r.onMusicProb(1f)
+        r.play(Synth.songA, 30.0)                 // A playing, nothing on screen
+        r.onLiveSong(songA)
+        r.play(Synth.songA, 20.0, start = 30.0)   // the steady window (24 s) is still partly pre-slide
+        val settling = events.filterIsInstance<RecognizerEvent.Match>().filter { it.window == "steady" && it.liveKey == "1|A" }
+        assertTrue(settling.isNotEmpty() && settling.all { it.decision == "settling" }, settling.map { it.decision }.toString())
+        assertEquals(0, r.state.accuracy.runs)
+        r.play(Synth.songA, 10.0, start = 50.0)
+        assertTrue(r.state.accuracy.runs > 0)
+    }
+
+    @Test
+    fun `a rival that doesn't itself match well raises no warning`() {
+        val takes = listOf(Synth.take("1|A", Synth.songA), Synth.take("2|B", Synth.songB))
+        val r = Recognizer(Config(steadyFrames = 48, wrongSlideMinScore = 1.01), takes, clock = { now++ }, onEvent = { events += it })
+        r.onMusicProb(1f)
+        r.onLiveSong(songB)
+        r.play(Synth.songA, 40.0, start = 5.0)
+        assertNull(r.state.wrongSlide)
+    }
+
+    @Test
+    fun `a late slide says whether the music before it was the song itself`() {
+        val r = recognizer(listOf(Synth.take("1|A", Synth.songA), Synth.take("2|B", Synth.songB)))
+        r.onMusicProb(1f)
+        now = 3_000_000L
+        r.play(Synth.songA, 25.0)                 // A plays…
+        now += 25_000
+        r.onLiveSong(songB)                       // …but the slide that goes up is B
+        val late = events.filterIsInstance<RecognizerEvent.LateSlide>().single()
+        assertEquals(false, late.heardBefore)
+
+        events.clear()
+        val again = recognizer(listOf(Synth.take("1|A", Synth.songA)))
+        again.onMusicProb(1f)
+        now += 60_000
+        again.play(Synth.songA, 25.0)
+        now += 25_000
+        again.onLiveSong(songA)
+        assertEquals(true, events.filterIsInstance<RecognizerEvent.LateSlide>().single().heardBefore)
+    }
+
+    @Test
+    fun `the slide check says waiting, then matches, then can't check an unlearned song`() {
+        val cfg = Config(steadyFrames = 48)
+        val r = twoListeners(listOf(Synth.take("1|A", Synth.songA), Synth.take("2|B", Synth.songB)))
+        assertNull(slideCheck(r.state, cfg))
+        r.onMusicProb(1f)
+        r.onLiveSong(songA)
+        r.play(Synth.songA, 10.0)
+        assertEquals("wait", slideCheck(r.state, cfg)!!.kind)
+        r.play(Synth.songA, 25.0, start = 10.0)
+        assertEquals("ok", slideCheck(r.state, cfg)!!.kind, slideCheck(r.state, cfg)!!.text)
+
+        val n = twoListeners(listOf(Synth.take("1|A", Synth.songA)))
+        n.onMusicProb(1f)
+        n.onLiveSong(LiveSong("9|New", "#9 New", 0))
+        n.play(Synth.songA, 30.0)
+        assertEquals("unknown", slideCheck(n.state, cfg)!!.kind)
+    }
 }

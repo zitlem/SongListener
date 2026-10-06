@@ -44,6 +44,11 @@ class Matcher(private val config: Config = Config()) {
             val current = bestPerSong[take.songKey]
             if (current == null || best.score > current.score) bestPerSong[take.songKey] = best
         }
+        if (config.cohort && bestPerSong.size > 1) {
+            val bias = Cohort.biases(this, takes, query.size)
+            val mean = bias.values.average()
+            for ((k, v) in bestPerSong) bias[k]?.let { bestPerSong[k] = v.copy(score = v.score - it + mean) }
+        }
         return MatchResult(bestPerSong.values.sortedByDescending { it.score })
     }
 
@@ -92,4 +97,46 @@ class Matcher(private val config: Config = Config()) {
             return s
         }
     }
+}
+
+/**
+ * Cohort normalisation: how well each song scores, on average, against music that is *not* it.
+ * A song with generic harmony scores well against everything and wins by default; subtracting
+ * this bias (and adding back the mean, to keep the scale) lets a song win only by matching better
+ * than it usually does. Pair scores are cached across matchers — replay rebuilds libraries many
+ * times from the same takes.
+ */
+internal object Cohort {
+    private const val WINDOWS_PER_TAKE = 2
+    private val pairs = java.util.concurrent.ConcurrentHashMap<String, Double>()
+
+    private fun id(t: SongTake) = "${t.songKey}@${t.recordedAt}"
+
+    /** Song key → mean best score against windows of other songs' takes in [takes]. */
+    fun biases(matcher: Matcher, takes: List<SongTake>, length: Int): MutableMap<String, Double> {
+        val bySong = takes.groupBy { it.songKey }
+        val out = HashMap<String, Double>()
+        for ((song, own) in bySong) {
+            val scores = takes.filter { it.songKey != song }.flatMap { other ->
+                windows(other, length).indices.map { w -> own.maxOf { pair(matcher, other, w, it, length) } }
+            }
+            if (scores.isNotEmpty()) out[song] = scores.average()
+        }
+        return out
+    }
+
+    private fun windows(t: SongTake, length: Int): List<List<FloatArray>> {
+        if (t.frames.size < length) return emptyList()
+        val span = t.frames.size - length
+        return (1..WINDOWS_PER_TAKE).map { i ->
+            val start = span * i / (WINDOWS_PER_TAKE + 1)
+            t.frames.subList(start, start + length)
+        }
+    }
+
+    private fun pair(matcher: Matcher, from: SongTake, window: Int, against: SongTake, length: Int): Double =
+        pairs.getOrPut("${id(from)}#$window#$length>${id(against)}") {
+            val q = windows(from, length)[window]
+            matcher.bestAlignment(q, sumProfile(q), against)?.score ?: 0.0
+        }
 }

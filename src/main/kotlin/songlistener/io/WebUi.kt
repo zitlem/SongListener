@@ -16,16 +16,60 @@ import songlistener.core.Suggestion
 import java.net.InetSocketAddress
 
 /**
- * Read-only web page with the same three columns as the desktop window: Hearing, Accuracy and
- * Learned songs. Served from [port] on every interface so a phone or the sound desk can watch.
+ * Read-only web page with the same two columns as the desktop window, Hearing and Learned
+ * songs, with the slide check under what's on screen. Served from [port] on every interface so a phone or the sound desk can watch.
  */
-class WebUi(private val engine: ListenerEngine, private val config: Config, private val port: Int = 8780) {
+class WebUi(private val engine: ListenerEngine, private val config: Config, port: Int = 8780) {
     private var server: HttpServer? = null
+    /** The port it is (or was last asked to be) served on. */
+    var port: Int = port
+        private set
+    private val _running = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val running: kotlinx.coroutines.flow.StateFlow<Boolean> = _running
+    private val _error = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    val error: kotlinx.coroutines.flow.StateFlow<String?> = _error
 
+    /** Moves the page to [newPort]: stops it and starts it again there. */
+    @Synchronized
+    fun restart(newPort: Int) {
+        stop()
+        port = newPort
+        start()
+    }
+
+    @Synchronized
     fun start() {
-        val s = runCatching { HttpServer.create(InetSocketAddress(port), 0) }.getOrNull() ?: return
+        val s = runCatching { HttpServer.create(InetSocketAddress(port), 0) }
+            .onFailure { _error.value = if (it is java.net.BindException) "port $port is in use" else (it.message ?: it::class.simpleName) }
+            .getOrNull() ?: return
         s.createContext("/api/state") { ex ->
             reply(ex, 200, "application/json; charset=utf-8", snapshot().toString())
+        }
+        s.createContext("/review") { ex -> reply(ex, 200, "text/html; charset=utf-8", REVIEW_PAGE) }
+        s.createContext("/api/recordings") { ex ->
+            val parts = ex.requestURI.path.removePrefix("/api/recordings").trim('/').split('/')
+            when {
+                ex.requestMethod == "GET" && parts == listOf("") -> {
+                    if (engine.reviews.value.isEmpty()) engine.refreshReview()
+                    reply(ex, 200, "application/json; charset=utf-8", recordingsJson().toString())
+                }
+                ex.requestMethod == "POST" && parts.size == 2 -> correct(ex, java.net.URLDecoder.decode(parts[0], "UTF-8"), parts[1])
+                else -> reply(ex, 404, "text/plain", "not found")
+            }
+        }
+        s.createContext("/api/songs") { ex ->
+            val q = ex.requestURI.rawQuery.orEmpty().split('&').firstOrNull { it.startsWith("q=") }
+                ?.let { java.net.URLDecoder.decode(it.removePrefix("q="), "UTF-8") }.orEmpty().trim()
+            val hits = if (q.isBlank()) emptyList() else kotlinx.coroutines.runBlocking { engine.knownSongs() }.filter { (k, label) ->
+                label.contains(q, ignoreCase = true) || k.substringBefore('|') == q.trimStart('#')
+            }.take(12)
+            reply(ex, 200, "application/json; charset=utf-8",
+                buildJsonArray { hits.forEach { (k, l) -> add(buildJsonObject { put("key", k); put("label", l) }) } }.toString())
+        }
+        s.createContext("/audio/") { ex ->
+            val name = java.net.URLDecoder.decode(ex.requestURI.path.removePrefix("/audio/"), "UTF-8")
+            val wav = engine.reviews.value.firstOrNull { it.name == name }?.wav
+            if (wav == null || !wav.exists()) reply(ex, 404, "text/plain", "not found") else sendAudio(ex, wav)
         }
         s.createContext("/") { ex ->
             if (ex.requestURI.path != "/") reply(ex, 404, "text/plain", "not found")
@@ -34,9 +78,99 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, priv
         s.executor = java.util.concurrent.Executors.newFixedThreadPool(2) { r -> Thread(r, "webui").apply { isDaemon = true } }
         s.start()
         server = s
+        _running.value = true
+        _error.value = null
     }
 
-    fun stop() { server?.stop(0) }
+    @Synchronized
+    fun stop() {
+        server?.stop(0)
+        server = null
+        _running.value = false
+    }
+
+    /** Where the main page can be opened: this Mac's network addresses, for a phone on the same network. */
+    fun urls(): List<String> = reviewUrls().map { it.removeSuffix("review") }
+
+    /** Where the review page can be opened: this Mac's network addresses (a phone on the same network can use them). */
+    fun reviewUrls(): List<String> = runCatching {
+        java.net.NetworkInterface.getNetworkInterfaces().toList().filter { it.isUp && !it.isLoopback }
+            .flatMap { it.inetAddresses.toList() }.filterIsInstance<java.net.Inet4Address>()
+            .map { "http://${it.hostAddress}:$port/review" }
+    }.getOrDefault(emptyList()).ifEmpty { listOf("http://localhost:$port/review") }
+
+    /** Applies a correction from the review page; every one is logged with the address it came from. */
+    private fun correct(ex: com.sun.net.httpserver.HttpExchange, name: String, action: String) {
+        if (engine.reviews.value.none { it.name == name }) return reply(ex, 404, "text/plain", "no such recording")
+        val from = "web " + ex.remoteAddress.address.hostAddress
+        when (action) {
+            "reviewed" -> engine.markReviewed(name, from)
+            "delete" -> engine.deleteRecording(name, from)
+            "relabel" -> {
+                val song = runCatching {
+                    kotlinx.serialization.json.Json.parseToJsonElement(ex.requestBody.readBytes().decodeToString())
+                        .let { (it as JsonObject)["songKey"]!!.let { v -> (v as JsonPrimitive).content } }
+                }.getOrNull()
+                if (song.isNullOrBlank() || !song.contains('|')) return reply(ex, 400, "text/plain", "songKey needed")
+                engine.relabel(name, song, from)
+            }
+            else -> return reply(ex, 404, "text/plain", "not found")
+        }
+        reply(ex, 200, "application/json", "{\"ok\":true}")
+    }
+
+    /** Sends a recording, honouring a byte Range so the browser's player can seek. */
+    private fun sendAudio(ex: com.sun.net.httpserver.HttpExchange, wav: java.io.File) {
+        val size = wav.length()
+        val range = ex.requestHeaders.getFirst("Range")?.let { Regex("bytes=(\\d*)-(\\d*)").find(it) }
+        val start = range?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+        val end = (range?.groupValues?.get(2)?.toLongOrNull() ?: (size - 1)).coerceAtMost(size - 1)
+        ex.responseHeaders.add("Content-Type", "audio/wav")
+        ex.responseHeaders.add("Accept-Ranges", "bytes")
+        if (range != null) ex.responseHeaders.add("Content-Range", "bytes $start-$end/$size")
+        val length = end - start + 1
+        ex.sendResponseHeaders(if (range != null) 206 else 200, if (ex.requestMethod == "HEAD") -1 else length)
+        if (ex.requestMethod == "HEAD") return ex.close()
+        java.io.RandomAccessFile(wav, "r").use { f ->
+            f.seek(start)
+            ex.responseBody.use { out ->
+                val buf = ByteArray(64 * 1024)
+                var left = length
+                while (left > 0) {
+                    val n = f.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    left -= n
+                }
+            }
+        }
+    }
+
+    private fun recordingsJson(): JsonArray = buildJsonArray {
+        for (item in engine.reviews.value) {
+            val l = item.labels
+            val c = item.check
+            add(buildJsonObject {
+                put("name", item.name)
+                put("song", l.songLabel)
+                put("key", l.songKey)
+                put("startedAt", l.startedAt)
+                put("origin", l.origin ?: "import")
+                put("seconds", l.endSeconds)
+                put("slideAt", l.goLiveSeconds)
+                put("reviewed", l.reviewed)
+                l.relabelledFrom?.let { put("relabelledFrom", songlistener.core.SongKeys.labelOf(it) ?: it) }
+                put("checked", c != null)
+                put("severity", c?.severity ?: 0)
+                c?.rivalKey?.let { put("rivalKey", it) }
+                c?.rivalLabel?.let { put("rivalLabel", it) }
+                c?.rivalScore?.let { put("rivalScore", it) }
+                put("flags", buildJsonArray {
+                    c?.flags?.forEach { f -> add(buildJsonObject { put("text", f.text); put("severity", f.severity) }) }
+                })
+            })
+        }
+    }
 
     private fun reply(ex: com.sun.net.httpserver.HttpExchange, code: Int, type: String, body: String) {
         val bytes = body.toByteArray()
@@ -72,6 +206,7 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, priv
             put("musicProb", st.musicProb.toDouble()); put("isMusic", st.isMusic)
             put("live", st.liveSong?.let { it.label + (it.section?.let { s -> " · section $s" } ?: "") }?.let(::JsonPrimitive) ?: JsonNull)
             put("cantCheckLive", st.cantCheckLive)
+            put("slideCheck", songlistener.core.slideCheck(st, config)?.let { c -> buildJsonObject { put("kind", c.kind); put("text", c.text) } } ?: JsonNull)
             put("steadyScore", config.steadyScore)
             put("neededSeconds", config.queryFrames / config.featuresPerSecond)
             put("wrongSlide", st.wrongSlide?.let { w ->
@@ -106,6 +241,9 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, priv
     }
 
     private companion object {
+        /** Plain HTML and script, kept as a resource so its `${'$'}{…}` aren't Kotlin templates. */
+        val REVIEW_PAGE: String by lazy { WebUi::class.java.getResource("/review.html")!!.readText() }
+
         val PAGE = """
 <!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>SongListener</title>
@@ -116,7 +254,7 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, priv
 .dot{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:6px;background:var(--bad)}.dot.on{background:#4caf50}
 meter,progress{width:160px;height:10px;vertical-align:middle}
 .ban{background:#7f1d1d;border-radius:8px;padding:12px;margin-bottom:12px;display:none}
-.cols{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;align-items:start}
+.cols{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;align-items:start}
 @media(max-width:800px){.cols{grid-template-columns:1fr}}
 .card{background:var(--card);border-radius:10px;padding:12px}
 h2{margin:0 0 8px;font-size:16px;border-bottom:1px solid #333;padding-bottom:8px}
@@ -124,13 +262,13 @@ h2{margin:0 0 8px;font-size:16px;border-bottom:1px solid #333;padding-bottom:8px
 .row{margin:6px 0}.song{padding:6px 0;border-bottom:1px solid #2a2a2a}.on-screen{font-weight:700}
 progress{width:100%}
 </style></head><body>
+<div class="bar"><a href="/review" style="color:#9ecbff">Review recordings →</a></div>
 <div class="bar"><span><i class="dot" id="cp"></i>ChurchPresenter</span><span><i class="dot" id="stt"></i>STT audio</span>
 <span>Music <progress id="mp" max="1" value="0" style="width:160px"></progress> <span id="mpv"></span></span></div>
 <div class="bar" id="live"></div>
 <div class="ban" id="wrong"></div>
 <div class="cols">
 <div class="card"><h2>Hearing</h2><div id="hearing"></div></div>
-<div class="card"><h2>Accuracy (while a learned song is live)</h2><div id="acc"></div></div>
 <div class="card"><h2>Learned songs</h2><div id="lib"></div></div>
 </div>
 <script>
@@ -140,7 +278,10 @@ const t=ms=>new Date(ms).toLocaleString([], {month:"short",day:"numeric",hour:"2
 function render(s){
  cp.className="dot"+(s.cpConnected?" on":"");stt.className="dot"+(s.sttConnected?" on":"");
  mp.value=s.musicProb;mpv.textContent=s.musicProb.toFixed(2);
- live.innerHTML="<b>"+(s.live?"On screen: "+e(s.live):"On screen: nothing (listening for songs)")+"</b>";
+ const sc=s.slideCheck, cls={ok:"ok",wrong:"bad",doubt:"warn"}[sc&&sc.kind]||"mut";
+ live.innerHTML="<b>"+(s.live?"On screen: "+e(s.live):"On screen: nothing (listening for songs)")+"</b>"+
+  (sc?'<span class="'+cls+'">Slide check: '+e(sc.text)+'</span>':"")+
+  (s.accuracy.runs?'<span class="mut">Slide checks this session: '+s.accuracy.top1+' of '+s.accuracy.runs+' matched</span>':"");
  wrong.style.display=s.wrongSlide?"block":"none";
  if(s.wrongSlide)wrong.innerHTML="<b>Wrong slide?</b> Music sounds like "+e(s.wrongSlide.heard)+" ("+s.wrongSlide.heardScore.toFixed(2)+") — screen shows "+e(s.wrongSlide.shown)+" ("+s.wrongSlide.shownScore.toFixed(2)+")";
  let h="";
@@ -152,10 +293,6 @@ function render(s){
  else{h+='<div class="mut" style="margin-top:8px">Top candidates (margin '+c.margin.toFixed(2)+')</div>';
   c.ranked.forEach(r=>{h+='<div class="row"><div>'+e(r.label)+(r.onScreen?" · on screen":"")+'</div><progress max="1" value="'+Math.max(0,r.score)+'"></progress> '+r.score.toFixed(2)+'<div class="mut">key '+(r.key>0?"+":"")+r.key+' · tempo ×'+r.tempo.toFixed(2)+' · at '+r.at+'s'+(r.section?' · '+e(r.section):'')+'</div></div>'})}
  hearing.innerHTML=h;
- const a=s.accuracy;
- acc.innerHTML=!a.runs?"Runs once a song that already has a learned take is on screen and music is playing.":
-  '<div>Match runs: '+a.runs+'</div><div>Top-1 correct: '+a.top1+' ('+pct(a.top1,a.runs)+')</div><div>Confident: '+a.confident+', of which correct: '+a.confidentHits+' ('+pct(a.confidentHits,a.confident)+')</div>'+
-  (a.last?'<div class="mut" style="margin-top:8px">Last prediction</div><div class="'+(a.last.hit?"ok":"bad")+'">'+e(a.last.label)+' '+a.last.score.toFixed(2)+' '+(a.last.hit?"✓":"✗")+'</div>':"");
  const r=s.recordings;
  lib.innerHTML='<div class="mut">Recordings: '+r.imported+' imported · '+r.live+' live · '+Math.round(r.bytes/1e6)+' MB</div>'+
   (s.library.length?s.library.map(x=>'<div class="song"><div class="'+(x.onScreen?"on-screen":"")+'">'+e(x.label)+'</div><div class="mut">'+x.takes+' take(s) · '+x.imported+' imported · '+x.live+' live · '+x.seconds+'s · '+t(x.lastRecorded)+'</div></div>').join(""):"<div>Nothing learned yet.</div>");

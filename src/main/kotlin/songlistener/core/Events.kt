@@ -49,6 +49,11 @@ sealed interface RecognizerEvent {
         val lateSeconds: Double,
         val hintLeadSeconds: Double?,
         val suggestionLeadSeconds: Double?,
+        /**
+         * Whether the music before the slide was this song (true), other music (false), or can't
+         * be told because the song hadn't been learned (null). Only `true` and not caught is a miss.
+         */
+        val heardBefore: Boolean? = null,
     ) : RecognizerEvent {
         val caught: Boolean get() = hintLeadSeconds != null || suggestionLeadSeconds != null
     }

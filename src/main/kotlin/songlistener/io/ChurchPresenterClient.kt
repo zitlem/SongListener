@@ -188,6 +188,12 @@ class ChurchPresenterClient(
         }.getOrElse { ShowResult.Failed(it.message ?: it::class.simpleName.orEmpty()) }
     }
 
+    /** Every song in ChurchPresenter's library, as number|title keys (empty when not connected). */
+    suspend fun catalogKeys(): List<String> {
+        val base = httpBase ?: return emptyList()
+        return (catalog ?: loadCatalog(base).also { catalog = it }).keys.toList()
+    }
+
     /** The songbooks that hold [number]/[title], per ChurchPresenter's catalog. */
     suspend fun songbooksOf(number: Int, title: String): List<String> {
         val base = httpBase ?: return emptyList()

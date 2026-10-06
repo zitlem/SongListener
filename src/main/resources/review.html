@@ -1,0 +1,59 @@
+<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width, initial-scale=1'>
+<title>Review Recordings</title>
+<style>
+:root{--bg:#f6f6f4;--card:#fff;--fg:#1d1d1f;--muted:#6e6e73;--line:#e3e3e0;--bad:#fbe9e7;--warn:#fff6dd;--ok:#e8f5ec;--accent:#3f6fd8;--red:#c4472d;--amber:#9a6b00}
+@media (prefers-color-scheme:dark){:root{--bg:#161618;--card:#1f1f22;--fg:#ececf0;--muted:#9a9aa2;--line:#333338;--bad:#3b1f1d;--warn:#3a3218;--ok:#1d3326;--accent:#7b93ff;--red:#ff7a5c;--amber:#ffd54f}}
+*{box-sizing:border-box}body{margin:0;padding:20px 16px;background:var(--bg);color:var(--fg);font:15px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+main{max-width:900px;margin:0 auto}h1{font-size:22px;margin:0 0 4px}.muted{color:var(--muted)}
+.bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:8px 0 16px}
+.rec{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:10px 0}
+.rec.s2{background:var(--bad)}.rec.s1{background:var(--warn)}.rec.done{background:var(--ok)}
+.title{font-weight:600;font-size:16px}.meta{font-size:13px}.flag{margin:4px 0}.flag.s2{color:var(--red)}.flag.s1{color:var(--amber)}.flag.s0{color:var(--muted)}a{color:var(--accent)}
+audio{width:100%;margin:8px 0}button{font:inherit;padding:6px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.danger{color:var(--red)}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}input{font:inherit;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);width:100%;margin-top:8px}
+.hits div{padding:6px;cursor:pointer;border-radius:6px}.hits div:hover{background:var(--line)}
+</style></head><body><main>
+<p><a href="/">← SongListener</a></p><h1>Review recordings</h1>
+<p class=muted>Listen, and correct any recording whose song was wrong on screen. A correction relabels the recording and re-learns it as the right song.</p>
+<div class=bar><label><input type=checkbox id=only checked style="width:auto;margin:0"> Only ones that need a listen</label><span id=count class=muted></span></div>
+<div id=list></div></main>
+<script>
+const q=(p)=>p;
+let data=[];
+async function load(){data=await (await fetch(q('/api/recordings'))).json();render()}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function fmt(t){return new Date(t).toLocaleString([], {weekday:'short',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})}
+function render(){
+  const only=document.getElementById('only').checked;
+  const flagged=data.filter(r=>r.severity>=1&&!r.reviewed);
+  document.getElementById('count').textContent=flagged.length+' flagged of '+data.length+(data.some(r=>!r.checked)?' · checking…':'');
+  const rows=(only?flagged:data).slice().sort((a,b)=>((b.reviewed?-1:b.severity)-(a.reviewed?-1:a.severity))||b.startedAt-a.startedAt);
+  document.getElementById('list').innerHTML=rows.length?rows.map(r=>`
+   <div class="rec ${r.reviewed?'done':'s'+r.severity}" data-name="${esc(r.name)}">
+    <div class=title>${esc(r.song)}</div>
+    <div class="meta muted">${fmt(r.startedAt)} · ${esc(r.origin)} · ${Math.round(r.seconds)} s · slide up at ${Math.round(r.slideAt)} s${r.relabelledFrom?' · corrected from '+esc(r.relabelledFrom):''}${r.reviewed?' · ✓ reviewed':''}</div>
+    ${r.checked?r.flags.map(f=>`<div class="flag s${f.severity}">⚑ ${esc(f.text)}</div>`).join(''):'<div class=muted>Checking…</div>'}
+    <audio controls preload=none src="${q('/audio/'+encodeURIComponent(r.name))}"></audio>
+    <div class=actions>
+      <button onclick="seek(this,${Math.max(0,r.slideAt-2)})">Play from slide</button>
+      ${r.reviewed?'':'<button onclick="act(this,\'reviewed\')">Looks right</button>'}
+      ${r.rivalKey&&r.rivalScore>=0.7?`<button class=primary onclick="relabel(this,'${esc(r.rivalKey)}')">It's ${esc(r.rivalLabel)}</button>`:''}
+      <button onclick="pick(this)">It's another song…</button>
+      <button class=danger onclick="del(this)">Delete</button>
+    </div><div class=picker></div></div>`).join(''):'<p class=muted>Nothing needs a listen.</p>';
+}
+const nameOf=b=>b.closest('.rec').dataset.name;
+function seek(b,t){const a=b.closest('.rec').querySelector('audio');a.currentTime=t;a.play()}
+async function post(name,action,body){await fetch(q('/api/recordings/'+encodeURIComponent(name)+'/'+action),{method:'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):''});setTimeout(load,800)}
+function act(b,a){post(nameOf(b),a)}
+function relabel(b,k){post(nameOf(b),'relabel',{songKey:k})}
+function del(b){if(confirm('Remove this recording and what was learned from it? (It is moved to the "deleted" folder, not erased.)'))post(nameOf(b),'delete')}
+function pick(b){const p=b.closest('.rec').querySelector('.picker');p.innerHTML='<input placeholder="Number or title" autofocus><div class=hits></div>';
+ const i=p.querySelector('input'),h=p.querySelector('.hits');i.focus();
+ i.oninput=async()=>{const r=await (await fetch(q('/api/songs?q='+encodeURIComponent(i.value)))).json();
+  h.innerHTML=r.map(s=>`<div data-k="${esc(s.key)}">${esc(s.label)}</div>`).join('')||'<span class=muted>No match</span>';
+  h.querySelectorAll('div').forEach(d=>d.onclick=()=>relabel(b,d.dataset.k))}}
+document.getElementById('only').onchange=render;
+load();setInterval(()=>{if(data.some(r=>!r.checked))load()},3000);
+</script></body></html>

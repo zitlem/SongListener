@@ -42,4 +42,12 @@ class TakeStoreTest {
         assertEquals(listOf("b"), store.loadAll().map { it.songKey })
         assertTrue(dir.listFiles()!!.none { it.name.endsWith(".tmp") })
     }
+
+    @Test
+    fun `one take can be deleted on its own`() {
+        val store = TakeStore(dir, maxTakesPerSong = 5)
+        store.save(take("a", 100L)); store.save(take("a", 200L))
+        store.deleteTake("a", 100L)
+        assertEquals(listOf(200L), store.loadAll().map { it.recordedAt })
+    }
 }

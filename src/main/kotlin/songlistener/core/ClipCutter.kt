@@ -37,6 +37,11 @@ data class ClipLabels(
     val origin: String? = null,
     /** For imports, what said what was on screen: `songlistener_log`, `play_log` or `churchpresenter_history`. */
     val importSource: String? = null,
+    /** Someone listened and confirmed the song is right ([reviewedAt] is when). */
+    val reviewed: Boolean = false,
+    val reviewedAt: Long? = null,
+    /** The song this was first labelled as, when someone corrected it. */
+    val relabelledFrom: String? = null,
 )
 
 class Clip(val samples: ShortArray, val labels: ClipLabels)
@@ -104,8 +109,13 @@ class ClipCutter(
             is RecognizerEvent.LiveChanged -> open?.let { c ->
                 if (c.offScreen == null) c.offScreen = now
                 if (c.end == null) {
-                    // Keep recording the tail; [onAudio] closes it.
-                    c.endReason = "off_screen"
+                    // Already a long silence: the tail would be trimmed off anyway, so end now.
+                    if (c.heardMusic && now - c.lastMusicEnd > quietLimit) {
+                        end(c, now, "off_screen")
+                        emitIfDone()
+                    }
+                    // Otherwise keep recording the tail; [onAudio] closes it.
+                    else c.endReason = "off_screen"
                 }
             }
             is RecognizerEvent.TakeSaved -> open?.takeIf { it.song.key == event.song.key }?.let {
@@ -136,10 +146,11 @@ class ClipCutter(
                 if (now >= c.goLive) c.heardMusic = true
             }
             val offScreen = c.offScreen
+            // A long pause with the slide still up (a prayer, a reading between verses) does not end
+            // the recording: the song may carry on. Trailing silence is trimmed when it does end.
             when {
-                offScreen != null && chunkEnd >= offScreen + tail -> close(c, offScreen + tail, "off_screen")
-                c.heardMusic && chunkEnd - c.lastMusicEnd > quietLimit -> close(c, c.lastMusicEnd + tail, "music_ended")
-                chunkEnd - c.start >= maxSamples -> close(c, c.start + maxSamples, "max_length")
+                offScreen != null && chunkEnd >= offScreen + tail -> end(c, offScreen + tail, "off_screen")
+                chunkEnd - c.start >= maxSamples -> end(c, c.start + maxSamples, "max_length")
             }
         }
         now += samples.size
@@ -150,7 +161,7 @@ class ClipCutter(
     /** Ends the recording in progress now (shutdown); it is kept if its take was. */
     fun finish(reason: String) {
         val c = open ?: return
-        if (c.end == null) close(c, now, reason)
+        if (c.end == null) end(c, now, reason)
         emitIfDone()
         // A take that never reported back is not kept.
         open?.let { open = null; onDropped(it.song, "no_take") }
@@ -159,7 +170,7 @@ class ClipCutter(
     private fun start(song: LiveSong) {
         open?.let { previous ->
             // Songs back to back: the previous one's tail ends here.
-            if (previous.end == null) close(previous, now, "next_song")
+            if (previous.end == null) end(previous, now, "next_song")
             emitIfDone()
             open?.let { open = null; onDropped(it.song, "no_take") }
         }
@@ -172,6 +183,12 @@ class ClipCutter(
         song.section?.let { c.sections += TimedSection(seconds(now - from), it) }
         holdStart = null
         open = c
+    }
+
+    /** Ends [c] at [at], or 3 s after its last music when it ended in a long silence (`music_ended`). */
+    private fun end(c: OpenClip, at: Long, reason: String) {
+        if (c.heardMusic && at - c.lastMusicEnd > quietLimit) close(c, c.lastMusicEnd + tail, "music_ended")
+        else close(c, at, reason)
     }
 
     private fun close(c: OpenClip, end: Long, reason: String) {

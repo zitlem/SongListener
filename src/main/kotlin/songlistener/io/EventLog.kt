@@ -67,6 +67,7 @@ class EventLog(private val dir: File, private val now: () -> LocalDateTime = Loc
                 e.hintLeadSeconds?.let { put("hintLeadSeconds", round(it)) }
                 e.suggestionLeadSeconds?.let { put("suggestionLeadSeconds", round(it)) }
                 put("caught", e.caught)
+                e.heardBefore?.let { put("heardBefore", it) }
             }
             is RecognizerEvent.Match -> {
                 put("live", e.liveKey)

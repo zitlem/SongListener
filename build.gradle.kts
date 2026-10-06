@@ -40,6 +40,9 @@ compose.desktop {
             packageName = "SongListener"
             // macOS bundles need a first version number above zero.
             packageVersion = "1.0.0"
+            // The web interface (WebUi) uses the JDK's built-in HTTP server, which the trimmed
+            // runtime leaves out unless named; without it the page silently never starts.
+            modules("jdk.httpserver")
         }
     }
 }
@@ -57,7 +60,7 @@ tasks.register<JavaExec>("replay") {
     description = "Leave-one-out replay of every saved song recording, e.g. ./gradlew replay -PsuggestScore=0.75"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("songlistener.io.ReplayMainKt")
-    listOf("suggestScore", "suggestMargin", "suggestStreak", "queryFrames", "musicDipToleranceSeconds", "tempoStretches", "feature", "framesPerFeature", "transpose", "steadyFrames", "steadyScore", "steadyMargin", "wrongSlideMargin", "origin").forEach { name ->
+    listOf("suggestScore", "suggestMargin", "suggestStreak", "queryFrames", "musicDipToleranceSeconds", "tempoStretches", "feature", "framesPerFeature", "transpose", "steadyFrames", "steadyScore", "steadyMargin", "wrongSlideMargin", "wrongSlideMinScore", "cohort", "origin").forEach { name ->
         project.findProperty(name)?.let { systemProperty("songlistener.$name", it.toString()) }
     }
 }
