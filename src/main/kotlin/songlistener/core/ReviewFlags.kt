@@ -1,6 +1,9 @@
 package songlistener.core
 
-/** Why a recording may be labelled with the wrong song. [severity] 2 = likely wrong, 1 = worth a listen. */
+/**
+ * Why a recording may be labelled with the wrong song. [severity] 2 = likely wrong, 1 = worth a
+ * listen, 0 = a note about the recording.
+ */
 data class ReviewFlag(val code: String, val text: String, val severity: Int)
 
 /** A recording's check: how it scores against its own song and the best other song, and the flags. */
@@ -10,6 +13,9 @@ data class ReviewCheck(
     val rivalLabel: String?,
     val rivalScore: Double?,
     val flags: List<ReviewFlag>,
+    /** Music held before the slide went up and learned as the intro, and how much of it sounds like the song. */
+    val introSeconds: Double? = null,
+    val introMatchedSeconds: Double? = null,
 ) {
     val severity: Int get() = flags.maxOfOrNull { it.severity } ?: 0
 }
@@ -25,6 +31,8 @@ object ReviewFlags {
     /** On screen this briefly and then replaced by another song: maybe a wrong click. */
     const val SHORT_SECONDS = 90.0
     private const val WINDOWS = 3
+    /** Held music this much longer than the part that sounds like the song gets a note. */
+    const val LONG_UNMATCHED_INTRO = 15.0
 
     /**
      * Checks one recording, given the take learned from it ([take], null if none) and everything
@@ -37,11 +45,14 @@ object ReviewFlags {
         matcher: Matcher,
         config: Config = Config(),
         editionUncertain: Boolean = false,
+        level: ClipLevel? = null,
     ): ReviewCheck {
         val flags = mutableListOf<ReviewFlag>()
         var own: Double? = null
         var rival: SongScore? = null
-        if (take == null) {
+        if (take == null && labels.relearnRequestedAt != null) {
+            flags += ReviewFlag("relearn", "What was learned from it was dropped (too hot); the song relearns the next time it's played", 0)
+        } else if (take == null) {
             flags += ReviewFlag("no_take", "No take was learned from it, so it can't be checked", 1)
         } else {
             val others = all.filter { !(it.songKey == take.songKey && it.recordedAt == take.recordedAt) }
@@ -66,7 +77,35 @@ object ReviewFlags {
         if (editionUncertain) {
             flags += ReviewFlag("edition", "Songbook edition uncertain (same number and title in two songbooks)", 0)
         }
-        return ReviewCheck(own, rival?.songKey, rival?.songLabel, rival?.score, flags)
+        var introSeconds: Double? = null
+        var introMatched: Double? = null
+        if (take != null) {
+            val frames = IntroFilter.introFrames(take)
+            if (frames > 0) {
+                val matched = IntroFilter.introFrames(IntroFilter.apply(take, config.copy(introMode = "match")))
+                introSeconds = frames / config.featuresPerSecond
+                introMatched = matched / config.featuresPerSecond
+                if (introSeconds - introMatched >= LONG_UNMATCHED_INTRO) {
+                    flags += ReviewFlag(
+                        "intro",
+                        "%.0f s of music before the slide, %.0f s of it sounding like this song: the rest was likely something else".format(introSeconds, introMatched) +
+                            if (config.introMode == "keep") " (and is being learned)" else " (not used for matching)",
+                        0,
+                    )
+                }
+            }
+        }
+        if (level != null && level.severity > 0) {
+            // Informational only (severity 0): clipping doesn't make the label wrong, and replay
+            // showed clipped recordings still recognised; it does tell the input gain was too hot.
+            val worst = level.worstSecond?.let { " — worst at %d:%02d".format(it / 60, it % 60) } ?: ""
+            flags += ReviewFlag(
+                "clipped",
+                "${if (level.severity >= 2) "Heavily clipped" else "Clipped"}: in %.0f%% of its seconds%s (input too hot)".format(level.clippedFraction * 100, worst),
+                0,
+            )
+        }
+        return ReviewCheck(own, rival?.songKey, rival?.songLabel, rival?.score, flags, introSeconds, introMatched)
     }
 
     /** Up to [WINDOWS] evenly spread windows of the song itself (after any intro). */

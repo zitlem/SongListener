@@ -14,7 +14,7 @@ class RecognizerTest {
     private val saved = mutableListOf<SongTake>()
     private val events = mutableListOf<RecognizerEvent>()
 
-    private fun recognizer(takes: List<SongTake> = emptyList()) =
+    private fun recognizer(takes: List<SongTake> = emptyList(), config: Config = this.config) =
         Recognizer(config, takes, clock = { now++ }, onTakeSaved = { saved += it }, onEvent = { events += it })
 
     private fun Recognizer.play(progression: List<Synth.Chord>, seconds: Double, seed: Int = 3, start: Double = 0.0) {
@@ -198,21 +198,41 @@ class RecognizerTest {
 
     @Test
     fun `a learned intro is recognised before the song is shown`() {
-        val r = recognizer(listOf(Synth.take("2|B", Synth.songB)))
+        val r = recognizer(listOf(Synth.take("2|B", Synth.songB)), config.copy(introMode = "keep"))
         r.onMusicProb(1f)
         // First time: the band plays an intro (songC's chords), then the song goes live.
-        r.play(Synth.songC, 30.0)
-        r.onLiveSong(songA)
-        r.play(Synth.songA, 40.0)
-        r.onLiveSong(null)
-        r.talk(30.0) // announcements
-        r.onLiveSong(songB)
-        r.onLiveSong(null) // another song came and went, so A is no longer the one just taken off
-        r.talk(30.0)
+        playWithIntro(r, Synth.songC)
         // Next time: only the intro plays, nothing on screen.
         r.play(Synth.songC, 20.0, seed = 11, start = 4.0)
         val suggestion = assertNotNull(r.state.lastSuggestion)
         assertEquals("1|A", suggestion.songKey)
+    }
+
+    /** Song A goes live after 30 s of [intro], plays 40 s and goes; then B comes and goes, so A is no longer the one just taken off. */
+    private fun playWithIntro(r: Recognizer, intro: List<Synth.Chord>, seed: Int = 1) {
+        r.play(intro, 30.0, seed = seed)
+        r.onLiveSong(songA)
+        r.play(Synth.songA, 40.0, seed = seed)
+        r.onLiveSong(null)
+        r.talk(30.0) // announcements
+        r.onLiveSong(songB)
+        r.onLiveSong(null)
+        r.talk(30.0)
+    }
+
+    @Test
+    fun `matching only intros like the song, a one-off intro is not learned but one heard twice is`() {
+        val r = recognizer(listOf(Synth.take("2|B", Synth.songB)), config.copy(introMode = "match"))
+        r.onMusicProb(1f)
+        playWithIntro(r, Synth.songC)
+        r.play(Synth.songC, 20.0, seed = 11, start = 4.0)
+        assertTrue(r.state.lastSuggestion?.songKey != "1|A", "a one-off intro unlike the song was learned")
+        r.onMusicProb(0f); r.talk(30.0); r.onMusicProb(1f)
+
+        // The same intro before song A a second time: it is A's own intro after all.
+        playWithIntro(r, Synth.songC, seed = 3)
+        r.play(Synth.songC, 20.0, seed = 11, start = 4.0)
+        assertEquals("1|A", assertNotNull(r.state.lastSuggestion).songKey)
     }
 
     @Test

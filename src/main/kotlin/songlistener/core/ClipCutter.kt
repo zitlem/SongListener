@@ -8,6 +8,27 @@ data class TimedSection(val at: Double, val section: Int)
 @Serializable
 data class MusicMark(val at: Double, val on: Boolean)
 
+/** A recording's loudness and clipping, from [ClipDetector]; levels in dBFS. */
+@Serializable
+data class ClipLevel(
+    val peakDb: Double,
+    val rmsDb: Double,
+    /** Share of samples at digital full scale. */
+    val fullScale: Double,
+    val clippedSeconds: Int,
+    val clippedFraction: Double,
+    val worstSecond: Int? = null,
+    /** 0 clean, 1 light, 2 heavy. */
+    val severity: Int,
+) {
+    companion object {
+        fun of(stats: ClipStats, config: Config = Config()) = ClipLevel(
+            stats.peakDb, stats.rmsDb, stats.fullScale, stats.clippedSeconds, stats.clippedFraction,
+            stats.worstSecond, stats.severity(config),
+        )
+    }
+}
+
 /**
  * What a song recording is: times are seconds from the start of the recording. [music] starts
  * with the state at 0 and lists every change after it, as STT reported it.
@@ -42,6 +63,13 @@ data class ClipLabels(
     val reviewedAt: Long? = null,
     /** The song this was first labelled as, when someone corrected it. */
     val relabelledFrom: String? = null,
+    /** How loud it was and whether it clipped; measured when saved (null on older recordings). */
+    val level: ClipLevel? = null,
+    /**
+     * When someone dropped the take learned from it because the input was too hot: the recording
+     * is kept, and the song is learned afresh the next time it is played.
+     */
+    val relearnRequestedAt: Long? = null,
 )
 
 class Clip(val samples: ShortArray, val labels: ClipLabels)

@@ -68,11 +68,24 @@ object Replay {
     /** A slide that went up this long after its music started counts as late. */
     const val LATE_SECONDS = 20.0
 
-    fun run(clips: List<Pair<String, Clip>>, config: Config = Config()): Pair<List<ReplayRow>, ReplaySummary> {
-        val takes = clips.map { (_, clip) -> learn(clip, config) }
+    /**
+     * [onProgress] gets (recordings done, total) — learning counts as the first half — and may throw
+     * to cancel. [learned] reuses takes from an earlier run with the same learning settings.
+     */
+    fun run(
+        clips: List<Pair<String, Clip>>,
+        config: Config = Config(),
+        learned: List<SongTake?>? = null,
+        onProgress: (Int, Int) -> Unit = { _, _ -> },
+    ): Pair<List<ReplayRow>, ReplaySummary> {
+        val total = clips.size * 2
+        val takes = learned ?: clips.mapIndexed { i, (_, clip) -> learn(clip, config).also { onProgress(i + 1, total) } }
         val rows = clips.mapIndexed { i, (name, clip) ->
+            onProgress(clips.size + i, total)
             val key = clip.labels.songKey
+            // What the app would hold: each song's takes cut to the limit, as it would cut them.
             val others = takes.filterIndexed { j, t -> j != i && t != null }.filterNotNull()
+                .groupBy { it.songKey }.values.flatMap { TakeSelection.keep(it, config) }
             if (others.none { it.songKey == key }) {
                 ReplayRow(name, key, clip.labels.songLabel, testable = false)
             } else {

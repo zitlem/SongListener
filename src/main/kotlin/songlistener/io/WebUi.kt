@@ -16,8 +16,10 @@ import songlistener.core.Suggestion
 import java.net.InetSocketAddress
 
 /**
- * Read-only web page with the same two columns as the desktop window, Hearing and Learned
- * songs, with the slide check under what's on screen. Served from [port] on every interface so a phone or the sound desk can watch.
+ * The web page: the same controls as the desktop window — connection, live status, Hearing and
+ * Learned songs, Review recordings and Tuning — served from [port] on every interface so a phone
+ * or the sound desk can use it. Anyone on the network can make changes; each is logged with the
+ * address it came from.
  */
 class WebUi(private val engine: ListenerEngine, private val config: Config, port: Int = 8780) {
     private var server: HttpServer? = null
@@ -46,12 +48,36 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, port
             reply(ex, 200, "application/json; charset=utf-8", snapshot().toString())
         }
         s.createContext("/review") { ex -> reply(ex, 200, "text/html; charset=utf-8", REVIEW_PAGE) }
+        s.createContext("/tuning") { ex -> reply(ex, 200, "text/html; charset=utf-8", TUNING_PAGE) }
+        s.createContext("/api/tuning") { ex -> tuningApi(ex) }
+        s.createContext("/api/control") { ex -> controlApi(ex) }
+        s.createContext("/report") { ex ->
+            val newest = runCatching { ServiceReport.writeAll(engine.logDir, engine.reportDir) }.getOrNull()
+            if (newest == null) reply(ex, 200, "text/html; charset=utf-8", "<p>No logs yet.</p>")
+            else reply(ex, 200, "text/html; charset=utf-8", newest.readText())
+        }
+        s.createContext("/logs") { ex ->
+            val name = ex.requestURI.path.removePrefix("/logs").trim('/')
+            val files = engine.logDir.listFiles { f -> f.name.endsWith(".jsonl") }.orEmpty().sortedByDescending { it.name }
+            if (name.isEmpty()) {
+                val list = files.joinToString("") { "<li><a href=\"/logs/${it.name}\">${it.name}</a> (${it.length() / 1024} KB)</li>" }
+                reply(ex, 200, "text/html; charset=utf-8",
+                    "<!doctype html><meta charset=utf-8><title>Logs</title><body style=\"font:15px system-ui;padding:16px\"><p><a href=\"/\">← SongListener</a></p><h1>Logs</h1><ul>$list</ul>")
+            } else {
+                val f = files.firstOrNull { it.name == name }
+                if (f == null) reply(ex, 404, "text/plain", "not found") else reply(ex, 200, "text/plain; charset=utf-8", f.readText())
+            }
+        }
         s.createContext("/api/recordings") { ex ->
             val parts = ex.requestURI.path.removePrefix("/api/recordings").trim('/').split('/')
             when {
                 ex.requestMethod == "GET" && parts == listOf("") -> {
                     if (engine.reviews.value.isEmpty()) engine.refreshReview()
                     reply(ex, 200, "application/json; charset=utf-8", recordingsJson().toString())
+                }
+                ex.requestMethod == "POST" && parts == listOf("relearn-clipped") -> {
+                    engine.relearnAllClipped("web " + ex.remoteAddress.address.hostAddress)
+                    reply(ex, 200, "application/json", "{\"ok\":true}")
                 }
                 ex.requestMethod == "POST" && parts.size == 2 -> correct(ex, java.net.URLDecoder.decode(parts[0], "UTF-8"), parts[1])
                 else -> reply(ex, 404, "text/plain", "not found")
@@ -106,6 +132,7 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, port
         when (action) {
             "reviewed" -> engine.markReviewed(name, from)
             "delete" -> engine.deleteRecording(name, from)
+            "relearn" -> engine.relearn(name, from)
             "relabel" -> {
                 val song = runCatching {
                     kotlinx.serialization.json.Json.parseToJsonElement(ex.requestBody.readBytes().decodeToString())
@@ -117,6 +144,132 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, port
             else -> return reply(ex, 404, "text/plain", "not found")
         }
         reply(ex, 200, "application/json", "{\"ok\":true}")
+    }
+
+    private fun body(ex: com.sun.net.httpserver.HttpExchange): JsonObject =
+        runCatching { kotlinx.serialization.json.Json.parseToJsonElement(ex.requestBody.readBytes().decodeToString()) as JsonObject }
+            .getOrDefault(JsonObject(emptyMap()))
+
+    private fun JsonObject.str(k: String): String? = (this[k] as? JsonPrimitive)?.content
+    private fun from(ex: com.sun.net.httpserver.HttpExchange) = "web " + ex.remoteAddress.address.hostAddress
+    private fun ok(ex: com.sun.net.httpserver.HttpExchange) = reply(ex, 200, "application/json", "{\"ok\":true}")
+
+    /** The main page's controls: connect, web port, dismiss, show, forget, forget-all. Same actions as the app's. */
+    private fun controlApi(ex: com.sun.net.httpserver.HttpExchange) {
+        if (ex.requestMethod != "POST") return reply(ex, 405, "text/plain", "POST only")
+        val b = body(ex)
+        when (ex.requestURI.path.removePrefix("/api/control").trim('/')) {
+            "connect" -> {
+                val cp = b.str("churchPresenterUrl"); val stt = b.str("sttUrl")
+                if (cp.isNullOrBlank() || stt.isNullOrBlank()) return reply(ex, 400, "text/plain", "addresses needed")
+                engine.tuning.saveConnection(cp.trim(), b.str("apiKey").orEmpty().trim(), stt.trim(), from(ex))
+            }
+            "webport" -> {
+                val p = b.str("port")?.toIntOrNull()?.takeIf { it in 1024..65535 } ?: return reply(ex, 400, "text/plain", "port 1024–65535")
+                engine.tuning.saveWebPort(p, from(ex))
+                reply(ex, 200, "application/json", "{\"port\":$p}")
+                // After answering: the page moves to the new port.
+                Thread { Thread.sleep(300); restart(p) }.start()
+                return
+            }
+            "dismiss" -> engine.state.value.wrongSlide?.let { engine.dismissed(it, from(ex)) }
+            "show" -> {
+                val key = b.str("songKey")?.takeIf { it.contains('|') } ?: return reply(ex, 400, "text/plain", "songKey needed")
+                engine.show(key, b.str("songbook").orEmpty(), from(ex))
+            }
+            "forget" -> {
+                val key = b.str("songKey")?.takeIf { it.contains('|') } ?: return reply(ex, 400, "text/plain", "songKey needed")
+                engine.forget(key, from(ex))
+            }
+            "forget-all" -> engine.forgetAll(from(ex))
+            else -> return reply(ex, 404, "text/plain", "not found")
+        }
+        ok(ex)
+    }
+
+    /** The Tuning page: GET its state; POST settings, test, test/stop, clipping. */
+    private fun tuningApi(ex: com.sun.net.httpserver.HttpExchange) {
+        val t = engine.tuning
+        if (ex.requestMethod == "GET") return reply(ex, 200, "application/json; charset=utf-8", tuningJson().toString())
+        val b = body(ex)
+        when (ex.requestURI.path.removePrefix("/api/tuning").trim('/')) {
+            "settings" -> t.saveMatching(
+                b.str("keepTakes") ?: "newest", b.str("maxTakes")?.toIntOrNull() ?: 5, b.str("agreement")?.toDoubleOrNull() ?: 0.0,
+                b.str("intro") ?: "match", b.str("confirmed")?.toBoolean() ?: false, from(ex),
+            )
+            "test" -> t.startTest(b.str("cleanOnly")?.toBoolean() ?: true, from(ex))
+            "test/stop" -> t.stopTest()
+            "clipping" -> t.checkClipping()
+            else -> return reply(ex, 404, "text/plain", "not found")
+        }
+        ok(ex)
+    }
+
+    private fun matchingJson(c: Config) = buildJsonObject {
+        put("keepTakes", c.keepTakes); put("maxTakes", c.maxTakesPerSong); put("agreement", c.takeAgreement)
+        put("intro", c.introMode); put("confirmed", c.confirmedParts)
+    }
+
+    fun tuningJson(): JsonObject {
+        val t = engine.tuning
+        val reviews = engine.reviews.value
+        val perSong = engine.clipStats.value.perSong
+        val test = t.test.value
+        val best = t.best(test.results)
+        val clipping = t.clipping.value
+        return buildJsonObject {
+            put("saved", matchingJson(t.savedConfig()))
+            put("running", matchingJson(t.running))
+            put("guide", buildJsonObject {
+                put("sttConnected", engine.stt.connected.value)
+                engine.level.value.let { put("clipping", it.clipping); put("hot", it.hot) }
+                put("clipped", reviews.count { r -> r.labels.relearnRequestedAt == null && r.check?.flags?.any { it.code == "clipped" } == true })
+                put("flagged", reviews.count { (it.check?.severity ?: 0) >= 1 && !it.labels.reviewed })
+                put("twice", perSong.count { it.value >= 2 }); put("thrice", perSong.count { it.value >= 3 })
+            })
+            put("test", buildJsonObject {
+                put("running", test.running); put("progress", test.progress); put("cleanOnly", test.cleanOnly)
+                test.status?.let { put("status", it) }
+                put("results", buildJsonArray {
+                    test.results.forEach { r ->
+                        val s = r.summary
+                        add(buildJsonObject {
+                            put("name", r.variant.name); put("matching", matchingJson(r.variant.config))
+                            put("right", s.rightAtAll); put("testable", s.testable); put("wrong", s.wrongSuggestions)
+                            s.meanTop1?.let { put("top1", it) }
+                            put("wrongSlideCaught", s.wrongSlideCaught); put("wrongSlideTests", s.wrongSlideTests); put("falseAlarms", s.falseAlarms)
+                            put("best", best != null && s.rightAtAll == best.summary.rightAtAll && s.wrongSuggestions == best.summary.wrongSuggestions)
+                        })
+                    }
+                })
+            })
+            put("clippingScan", buildJsonObject {
+                put("busy", clipping.busy)
+                clipping.rows?.let { rows ->
+                    put("days", buildJsonArray {
+                        ClipScan.days(rows).reversed().forEach { d -> add(buildJsonObject {
+                            put("day", d.day.toString()); put("recordings", d.recordings); put("clean", d.clean); put("light", d.light); put("heavy", d.heavy)
+                            put("loudestPeakDb", d.loudestPeakDb); put("medianRmsDb", d.medianRmsDb)
+                        }) }
+                    })
+                    put("rows", buildJsonArray {
+                        ClipScan.worstFirst(rows).forEach { r -> add(buildJsonObject {
+                            put("name", r.name); put("origin", r.labels.origin ?: "-"); put("peakDb", r.level.peakDb); put("rmsDb", r.level.rmsDb)
+                            put("clippedFraction", r.level.clippedFraction); put("worst", ClipScan.mmss(r.level.worstSecond)); put("severity", r.level.severity)
+                        }) }
+                    })
+                }
+            })
+        }
+    }
+
+    private fun showJson(songKey: String): JsonObject {
+        engine.prepareShow(songKey)
+        return buildJsonObject {
+            put("songKey", songKey)
+            engine.editions.value[songKey]?.let { books -> put("books", buildJsonArray { books.forEach { add(JsonPrimitive(it)) } }) }
+            engine.showStatus.value[songKey]?.let { put("status", it) }
+        }
     }
 
     /** Sends a recording, honouring a byte Range so the browser's player can seek. */
@@ -159,14 +312,17 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, port
                 put("seconds", l.endSeconds)
                 put("slideAt", l.goLiveSeconds)
                 put("reviewed", l.reviewed)
+                put("relearnRequested", l.relearnRequestedAt != null)
                 l.relabelledFrom?.let { put("relabelledFrom", songlistener.core.SongKeys.labelOf(it) ?: it) }
                 put("checked", c != null)
+                c?.introSeconds?.let { put("introSeconds", it) }
+                c?.introMatchedSeconds?.let { put("introMatchedSeconds", it) }
                 put("severity", c?.severity ?: 0)
                 c?.rivalKey?.let { put("rivalKey", it) }
                 c?.rivalLabel?.let { put("rivalLabel", it) }
                 c?.rivalScore?.let { put("rivalScore", it) }
                 put("flags", buildJsonArray {
-                    c?.flags?.forEach { f -> add(buildJsonObject { put("text", f.text); put("severity", f.severity) }) }
+                    c?.flags?.forEach { f -> add(buildJsonObject { put("code", f.code); put("text", f.text); put("severity", f.severity) }) }
                 })
             })
         }
@@ -204,16 +360,43 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, port
             put("cpConnected", engine.churchPresenter.connected.value)
             put("sttConnected", engine.stt.connected.value)
             put("musicProb", st.musicProb.toDouble()); put("isMusic", st.isMusic)
+            engine.level.value.let { l -> put("peakDb", l.peakDb); put("clipping", l.clipping); put("clippedRecently", l.clippedRecently); put("hot", l.hot) }
             put("live", st.liveSong?.let { it.label + (it.section?.let { s -> " · section $s" } ?: "") }?.let(::JsonPrimitive) ?: JsonNull)
             put("cantCheckLive", st.cantCheckLive)
             put("slideCheck", songlistener.core.slideCheck(st, config)?.let { c -> buildJsonObject { put("kind", c.kind); put("text", c.text) } } ?: JsonNull)
             put("steadyScore", config.steadyScore)
             put("neededSeconds", config.queryFrames / config.featuresPerSecond)
-            put("wrongSlide", st.wrongSlide?.let { w ->
-                buildJsonObject { put("heard", w.heard.songLabel); put("heardScore", w.heard.score); put("shown", w.shown.label); put("shownScore", w.shownScore) }
+            put("wrongSlide", st.wrongSlide?.takeIf { it.at != engine.dismissedWrongSlide.value }?.let { w ->
+                buildJsonObject {
+                    put("heard", w.heard.songLabel); put("heardScore", w.heard.score); put("shown", w.shown.label); put("shownScore", w.shownScore)
+                    put("show", showJson(w.heard.songKey))
+                }
             } ?: JsonNull)
             put("suggested", suggestion(st.lastSuggestion))
-            put("hint", suggestion(st.hint?.takeIf { it.songKey != st.lastSuggestion?.songKey }))
+            st.lastSuggestion?.takeIf { it.songKey != liveKey }?.let { put("suggestedShow", showJson(it.songKey)) }
+            val hint = st.hint?.takeIf { it.songKey != st.lastSuggestion?.songKey }
+            put("hint", suggestion(hint))
+            hint?.takeIf { it.songKey != liveKey }?.let { put("hintShow", showJson(it.songKey)) }
+            val saved = engine.tuning.saved.value
+            put("settings", buildJsonObject {
+                put("churchPresenterUrl", saved.churchPresenterUrl); put("apiKey", saved.apiKey); put("sttUrl", saved.sttUrl)
+                put("webPort", port); put("webUrls", buildJsonArray { urls().forEach { add(JsonPrimitive(it)) } })
+                put("restartNeeded", engine.tuning.savedConfig() != engine.tuning.running)
+            })
+            engine.churchPresenter.error.value?.let { put("cpError", it) }
+            engine.stt.error.value?.let { put("sttError", it) }
+            val reviews = engine.reviews.value
+            put("review", buildJsonObject {
+                put("flagged", reviews.count { (it.check?.severity ?: 0) >= 1 && !it.labels.reviewed })
+                put("clipped", reviews.count { r -> r.labels.relearnRequestedAt == null && r.check?.flags?.any { it.code == "clipped" } == true })
+            })
+            put("take", buildJsonObject {
+                put("introSeconds", (st.recordingIntroFrames / config.featuresPerSecond).toInt())
+                put("songSeconds", ((st.recordingFrames - st.recordingIntroFrames) / config.featuresPerSecond).toInt())
+                put("neededSeconds", (config.minTakeFrames / config.featuresPerSecond).toInt())
+                put("heldSeconds", (st.lookbackFrames / config.featuresPerSecond).toInt())
+            })
+            put("queryFrames", st.queryFrames); put("queryNeeded", config.queryFrames)
             put("candidates", st.lastMatch?.let { m ->
                 buildJsonObject {
                     put("margin", m.margin)
@@ -231,7 +414,7 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, port
             put("library", buildJsonArray {
                 engine.library.value.forEach { s ->
                     add(buildJsonObject {
-                        put("label", s.label); put("takes", s.takes); put("seconds", s.seconds)
+                        put("key", s.key); put("label", s.label); put("takes", s.takes); put("seconds", s.seconds)
                         put("imported", s.recordings - s.liveRecordings); put("live", s.liveRecordings)
                         put("lastRecorded", s.lastRecorded); put("onScreen", s.key == liveKey)
                     })
@@ -244,62 +427,7 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, port
         /** Plain HTML and script, kept as a resource so its `${'$'}{…}` aren't Kotlin templates. */
         val REVIEW_PAGE: String by lazy { WebUi::class.java.getResource("/review.html")!!.readText() }
 
-        val PAGE = """
-<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>SongListener</title>
-<style>
-:root{color-scheme:dark;--bg:#121212;--card:#1e1e1e;--fg:#e6e6e6;--mut:#8a8a8a;--ok:#81c784;--warn:#ffd54f;--bad:#e57373}
-*{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif}
-.bar{display:flex;flex-wrap:wrap;gap:16px;align-items:center;margin-bottom:12px}
-.dot{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:6px;background:var(--bad)}.dot.on{background:#4caf50}
-meter,progress{width:160px;height:10px;vertical-align:middle}
-.ban{background:#7f1d1d;border-radius:8px;padding:12px;margin-bottom:12px;display:none}
-.cols{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;align-items:start}
-@media(max-width:800px){.cols{grid-template-columns:1fr}}
-.card{background:var(--card);border-radius:10px;padding:12px}
-h2{margin:0 0 8px;font-size:16px;border-bottom:1px solid #333;padding-bottom:8px}
-.mut{color:var(--mut);font-size:13px}.big{font-size:22px}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
-.row{margin:6px 0}.song{padding:6px 0;border-bottom:1px solid #2a2a2a}.on-screen{font-weight:700}
-progress{width:100%}
-</style></head><body>
-<div class="bar"><a href="/review" style="color:#9ecbff">Review recordings →</a></div>
-<div class="bar"><span><i class="dot" id="cp"></i>ChurchPresenter</span><span><i class="dot" id="stt"></i>STT audio</span>
-<span>Music <progress id="mp" max="1" value="0" style="width:160px"></progress> <span id="mpv"></span></span></div>
-<div class="bar" id="live"></div>
-<div class="ban" id="wrong"></div>
-<div class="cols">
-<div class="card"><h2>Hearing</h2><div id="hearing"></div></div>
-<div class="card"><h2>Learned songs</h2><div id="lib"></div></div>
-</div>
-<script>
-const e=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const pct=(n,d)=>d?Math.round(n*100/d)+"%":"–";
-const t=ms=>new Date(ms).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
-function render(s){
- cp.className="dot"+(s.cpConnected?" on":"");stt.className="dot"+(s.sttConnected?" on":"");
- mp.value=s.musicProb;mpv.textContent=s.musicProb.toFixed(2);
- const sc=s.slideCheck, cls={ok:"ok",wrong:"bad",doubt:"warn"}[sc&&sc.kind]||"mut";
- live.innerHTML="<b>"+(s.live?"On screen: "+e(s.live):"On screen: nothing (listening for songs)")+"</b>"+
-  (sc?'<span class="'+cls+'">Slide check: '+e(sc.text)+'</span>':"")+
-  (s.accuracy.runs?'<span class="mut">Slide checks this session: '+s.accuracy.top1+' of '+s.accuracy.runs+' matched</span>':"");
- wrong.style.display=s.wrongSlide?"block":"none";
- if(s.wrongSlide)wrong.innerHTML="<b>Wrong slide?</b> Music sounds like "+e(s.wrongSlide.heard)+" ("+s.wrongSlide.heardScore.toFixed(2)+") — screen shows "+e(s.wrongSlide.shown)+" ("+s.wrongSlide.shownScore.toFixed(2)+")";
- let h="";
- if(s.cantCheckLive&&s.live)h+='<div class="mut">Can\'t check the slide: this song hasn\'t been learned yet.</div>';
- if(s.suggested)h+='<div class="mut">Suggested</div><div class="big ok">'+e(s.suggested.label)+'</div>'+(s.suggested.section?'<div>Band is at: '+e(s.suggested.section)+'</div>':'')+'<div class="mut">score '+s.suggested.score.toFixed(2)+' · '+t(s.suggested.at)+'</div>';
- if(s.hint)h+='<div class="mut" style="margin-top:8px">Sounds like… (early guess)</div><div class="big warn">'+e(s.hint.label)+'</div><div class="mut">score '+s.hint.score.toFixed(2)+' · '+t(s.hint.at)+'</div>';
- const c=s.candidates;
- if(!c||!c.ranked.length)h+='<div class="row">Listening — needs '+Math.round(s.neededSeconds)+'s of continuous music and at least one learned song.</div>';
- else{h+='<div class="mut" style="margin-top:8px">Top candidates (margin '+c.margin.toFixed(2)+')</div>';
-  c.ranked.forEach(r=>{h+='<div class="row"><div>'+e(r.label)+(r.onScreen?" · on screen":"")+'</div><progress max="1" value="'+Math.max(0,r.score)+'"></progress> '+r.score.toFixed(2)+'<div class="mut">key '+(r.key>0?"+":"")+r.key+' · tempo ×'+r.tempo.toFixed(2)+' · at '+r.at+'s'+(r.section?' · '+e(r.section):'')+'</div></div>'})}
- hearing.innerHTML=h;
- const r=s.recordings;
- lib.innerHTML='<div class="mut">Recordings: '+r.imported+' imported · '+r.live+' live · '+Math.round(r.bytes/1e6)+' MB</div>'+
-  (s.library.length?s.library.map(x=>'<div class="song"><div class="'+(x.onScreen?"on-screen":"")+'">'+e(x.label)+'</div><div class="mut">'+x.takes+' take(s) · '+x.imported+' imported · '+x.live+' live · '+x.seconds+'s · '+t(x.lastRecorded)+'</div></div>').join(""):"<div>Nothing learned yet.</div>");
-}
-async function tick(){try{render(await (await fetch("/api/state")).json())}catch(_){cp.className=stt.className="dot"}}
-tick();setInterval(tick,1000);
-</script></body></html>
-""".trimIndent()
+        val PAGE: String by lazy { WebUi::class.java.getResource("/index.html")!!.readText() }
+        val TUNING_PAGE: String by lazy { WebUi::class.java.getResource("/tuning.html")!!.readText() }
     }
 }

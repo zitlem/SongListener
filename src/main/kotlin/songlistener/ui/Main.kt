@@ -18,6 +18,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -61,10 +62,13 @@ import java.util.Date
 
 private val dataDir = File(System.getProperty("user.home"), ".songlistener")
 private val settingsFile = File(dataDir, "config.json")
-private val config = Config()
+/** Built once at start: matching settings changed in the Tuning window apply from the next start. */
+private val config = AppSettings.load(settingsFile).applyTo(Config())
 
 /** The review window is open. */
 private var reviewOpen by mutableStateOf(false)
+/** The tuning window is open. */
+private var tuningOpen by mutableStateOf(false)
 
 fun main() {
     // Made before the window reads the settings file, so its Connect save keeps the id.
@@ -74,12 +78,15 @@ fun main() {
     Runtime.getRuntime().addShutdownHook(Thread { engine.shutdown(); web.stop() })
     // Once addresses have been saved by Connect, connect at launch so it can be left running (or
     // started at login) and pick up whenever ChurchPresenter and STT come up.
+    // Check the recordings in the background, so the Review button can say how many need a look.
+    engine.refreshReview()
     if (settingsFile.exists()) {
         val saved = AppSettings.load(settingsFile)
         engine.connect(saved.churchPresenterUrl, saved.apiKey, saved.sttUrl)
     }
     application {
         if (reviewOpen) ReviewWindow(engine, web.reviewUrls().first()) { reviewOpen = false }
+        if (tuningOpen) TuningWindow(engine) { tuningOpen = false }
         Window(
             onCloseRequest = { engine.shutdown(); exitApplication() },
             title = "SongListener",
@@ -113,10 +120,13 @@ private fun App(engine: ListenerEngine, web: WebUi) {
         Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Panel("Hearing", Modifier.weight(1f)) { Hearing(engine, state) }
             Panel("Learned songs", Modifier.weight(1f)) {
-                Text(
-                    "Recordings: ${clips.imported} imported · ${clips.live} live · ${"%.0f".format(clips.bytes / 1_000_000.0)} MB",
-                    style = MaterialTheme.typography.bodySmall, color = Color.Gray,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Recordings: ${clips.imported} imported · ${clips.live} live · ${"%.0f".format(clips.bytes / 1_000_000.0)} MB",
+                        style = MaterialTheme.typography.bodySmall, color = Color.Gray, modifier = Modifier.weight(1f),
+                    )
+                    if (library.isNotEmpty() || clips.count > 0) ForgetAll(library.size) { engine.forgetAll() }
+                }
                 Library(state, library, engine::forget)
             }
         }
@@ -125,7 +135,9 @@ private fun App(engine: ListenerEngine, web: WebUi) {
 
 @Composable
 private fun ConnectionBar(engine: ListenerEngine) {
-    var settings by remember { mutableStateOf(AppSettings.load(settingsFile)) }
+    // Follows changes saved from the web page too.
+    val saved by engine.tuning.saved.collectAsState()
+    var settings by remember(saved) { mutableStateOf(saved) }
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         OutlinedTextField(settings.churchPresenterUrl, { settings = settings.copy(churchPresenterUrl = it) },
             label = { Text("ChurchPresenter") }, singleLine = true, modifier = Modifier.weight(1f))
@@ -134,11 +146,7 @@ private fun ConnectionBar(engine: ListenerEngine) {
         OutlinedTextField(settings.sttUrl, { settings = settings.copy(sttUrl = it) },
             label = { Text("STT server") }, singleLine = true, modifier = Modifier.weight(1f))
         Button(onClick = {
-            // Only its own fields: the rest (web port, device id) may have changed since this was loaded.
-            AppSettings.save(settingsFile, AppSettings.load(settingsFile).copy(
-                churchPresenterUrl = settings.churchPresenterUrl, apiKey = settings.apiKey, sttUrl = settings.sttUrl,
-            ))
-            engine.connect(settings.churchPresenterUrl, settings.apiKey, settings.sttUrl)
+            engine.tuning.saveConnection(settings.churchPresenterUrl, settings.apiKey, settings.sttUrl)
         }) { Text("Connect") }
         TextButton(onClick = {
             engine.logDir.mkdirs()
@@ -151,7 +159,19 @@ private fun ConnectionBar(engine: ListenerEngine) {
                 }
             }.start()
         }) { Text("Report") }
-        TextButton(onClick = { reviewOpen = true }) { Text("Review") }
+        TextButton(onClick = { tuningOpen = true }) { Text("Tuning") }
+        val reviews by engine.reviews.collectAsState()
+        val flagged = reviews.count { (it.check?.severity ?: 0) >= 1 && !it.labels.reviewed }
+        val clipped = reviews.count { r -> r.labels.relearnRequestedAt == null && r.check?.flags?.any { it.code == "clipped" } == true }
+        Button(
+            onClick = { reviewOpen = true },
+            colors = if (flagged + clipped > 0) ButtonDefaults.buttonColors(containerColor = Color(0xFF8A6D1F)) else ButtonDefaults.buttonColors(),
+        ) {
+            Text("Review recordings" + listOfNotNull(
+                flagged.takeIf { it > 0 }?.let { "$it flagged" },
+                clipped.takeIf { it > 0 }?.let { "$it clipped" },
+            ).joinToString(" · ", " (", ")").takeIf { flagged + clipped > 0 }.orEmpty())
+        }
     }
 }
 
@@ -164,7 +184,7 @@ private fun StatusRow(engine: ListenerEngine, state: RecognizerState, web: WebUi
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Dot("ChurchPresenter", cpConnected, cpError)
-            WebRow(web)
+            WebRow(engine, web)
             Row(horizontalArrangement = Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
                 Dot("STT audio", sttConnected, sttError)
                 Text("Music", style = MaterialTheme.typography.labelLarge)
@@ -174,6 +194,14 @@ private fun StatusRow(engine: ListenerEngine, state: RecognizerState, web: WebUi
                     color = if (state.isMusic) Color(0xFF4CAF50) else Color.Gray,
                 )
                 Text("%.2f".format(state.musicProb))
+                val level by engine.level.collectAsState()
+                Text(
+                    "Level " + (if (level.peakDb > -96) "%.1f dBFS".format(level.peakDb) else "–") +
+                        if (level.clipping) "  ·  CLIPPING (${level.clippedRecently} of last 10 s) — turn the input down" else "",
+                    color = when {
+                        level.clipping -> Color(0xFFE57373); level.hot -> Color(0xFFFFD54F); else -> Color(0xFF81C784)
+                    },
+                )
             }
             val live = state.liveSong
             Text(
@@ -219,7 +247,7 @@ private fun StatusRow(engine: ListenerEngine, state: RecognizerState, web: WebUi
 
 /** The web page's address (click to open), and its port, which can be changed here. */
 @Composable
-private fun WebRow(web: WebUi) {
+private fun WebRow(engine: ListenerEngine, web: WebUi) {
     val running by web.running.collectAsState()
     val error by web.error.collectAsState()
     var port by remember { mutableStateOf(web.port.toString()) }
@@ -242,7 +270,7 @@ private fun WebRow(web: WebUi) {
         if (valid && (wanted != web.port || !running)) {
             TextButton(onClick = {
                 Thread { web.restart(wanted!!) }.start()
-                AppSettings.save(settingsFile, AppSettings.load(settingsFile).copy(webPort = wanted!!))
+                engine.tuning.saveWebPort(wanted!!)
             }) { Text(if (wanted == web.port) "Retry" else "Use port $wanted") }
         } else if (!valid) {
             Text("1024–65535", color = Color(0xFFE57373), style = MaterialTheme.typography.bodySmall)
@@ -277,7 +305,8 @@ private fun Panel(title: String, modifier: Modifier, content: @Composable () -> 
 @Composable
 private fun WrongSlideBanner(engine: ListenerEngine, state: RecognizerState) {
     val w = state.wrongSlide ?: return
-    var dismissedAt by remember { mutableStateOf<Long?>(null) }
+    // Dismissed here or on the web page: hidden in both.
+    val dismissedAt by engine.dismissedWrongSlide.collectAsState()
     if (dismissedAt == w.at) return
     Card(
         Modifier.fillMaxWidth(),
@@ -292,7 +321,7 @@ private fun WrongSlideBanner(engine: ListenerEngine, state: RecognizerState) {
                 )
             }
             ShowButtons(engine, w.heard.songKey, label = "Show ${w.heard.songLabel.substringBefore(' ')}")
-            TextButton(onClick = { dismissedAt = w.at; engine.dismissed(w) }) { Text("Dismiss", color = Color.White) }
+            TextButton(onClick = { engine.dismissed(w) }) { Text("Dismiss", color = Color.White) }
         }
     }
 }
@@ -371,6 +400,20 @@ private fun ShowButtons(engine: ListenerEngine, songKey: String, label: String =
             status == "declined" -> Text("Declined in ChurchPresenter", color = Color(0xFFE57373))
             status?.startsWith("failed") == true -> Text(status.removePrefix("failed: "), color = Color(0xFFE57373), style = MaterialTheme.typography.bodySmall)
         }
+    }
+}
+
+/** Moves every take and recording aside to start fresh; two clicks, like Forget. */
+@Composable
+private fun ForgetAll(songs: Int, onConfirm: () -> Unit) {
+    var confirming by remember { mutableStateOf(false) }
+    if (confirming) {
+        LaunchedEffect(Unit) { delay(4000); confirming = false }
+        TextButton(onClick = { confirming = false; onConfirm() }) {
+            Text("Confirm: forget all $songs songs", color = Color(0xFFE57373))
+        }
+    } else {
+        TextButton(onClick = { confirming = true }) { Text("Forget all…") }
     }
 }
 

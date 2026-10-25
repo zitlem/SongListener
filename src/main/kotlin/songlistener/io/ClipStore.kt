@@ -15,7 +15,7 @@ import java.time.format.DateTimeFormatter
 /**
  * Song recordings: `<yyyy-MM-dd_HHmmss>_<song>.wav` (16-bit mono PCM) with a `.json` of its
  * [ClipLabels] beside it, under [dir]. Never pruned automatically — they are training data — and
- * deleted only per song, by [delete]. Service audio: never commit these anywhere.
+ * deleted only per song, by [delete], or all at once, by [deleteAll]. Service audio: never commit these anywhere.
  */
 class ClipStore(private val dir: File) {
     private val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
@@ -52,6 +52,10 @@ class ClipStore(private val dir: File) {
             }
             .filter { it.first.exists() }
             .sortedBy { it.second.startedAt }
+
+    /** The labels of the recording [wav], read fresh. */
+    fun labelsOf(wav: File): ClipLabels? = File(dir, wav.name.removeSuffix(".wav") + ".json").takeIf { it.exists() }
+        ?.let { f -> runCatching { withDefaults(json.decodeFromString(ClipLabels.serializer(), f.readText())) }.getOrNull() }
 
     /** Every recording with its audio, oldest first. */
     fun loadAll(): List<Pair<File, Clip>> = labels().mapNotNull { (wav, labels) ->
@@ -92,6 +96,14 @@ class ClipStore(private val dir: File) {
         labels().filter { it.second.songKey == songKey }.forEach { (wav, _) ->
             wav.delete()
             File(dir, wav.name.removeSuffix(".wav") + ".json").delete()
+        }
+    }
+
+    /** Moves every recording into [trash], like [deleteOne] but for all of them. */
+    fun deleteAll(trash: File) {
+        trash.mkdirs()
+        dir.listFiles { f -> f.name.endsWith(".wav") || f.name.endsWith(".json") }.orEmpty().forEach { f ->
+            if (!f.renameTo(File(trash, f.name))) f.delete()
         }
     }
 

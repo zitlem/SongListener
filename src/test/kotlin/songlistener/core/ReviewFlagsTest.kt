@@ -42,4 +42,14 @@ class ReviewFlagsTest {
         val c = ReviewFlags.check(labels("1|A"), null, emptyList(), matcher, config, editionUncertain = true)
         assertEquals(listOf("no_take", "edition"), c.flags.map { it.code })
     }
+
+    @Test
+    fun `a clipped recording gets a note that doesn't flag it for review`() {
+        val level = ClipLevel(0.0, -6.0, 0.02, 150, 0.9, 99, severity = 2)
+        val c = ReviewFlags.check(labels("1|A"), null, emptyList(), matcher, config, level = level)
+        val flag = c.flags.single { it.code == "clipped" }
+        assertEquals(0, flag.severity)
+        assertTrue("1:39" in flag.text, flag.text)
+        assertTrue(ReviewFlags.check(labels("1|A"), null, emptyList(), matcher, config, level = level.copy(severity = 0)).flags.none { it.code == "clipped" })
+    }
 }

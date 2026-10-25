@@ -13,7 +13,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Checkbox
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -53,23 +53,58 @@ fun ReviewWindow(engine: ListenerEngine, webUrl: String?, onClose: () -> Unit) {
                 LaunchedEffect(Unit) { engine.refreshReview() }
                 val items by engine.reviews.collectAsState()
                 val checking by engine.reviewChecking.collectAsState()
-                var flaggedOnly by remember { mutableStateOf(true) }
-                val shown = items.filter { !flaggedOnly || (it.check?.severity ?: 0) >= 1 && !it.labels.reviewed }
+                // `flagged` (needs a listen), `clipped` (input too hot) or `all`.
+                var show by remember { mutableStateOf("flagged") }
+                fun isClipped(it: ReviewItem) = it.check?.flags?.any { f -> f.code == "clipped" } == true
+                val shown = items.filter {
+                    when (show) {
+                        "flagged" -> (it.check?.severity ?: 0) >= 1 && !it.labels.reviewed
+                        "clipped" -> isClipped(it)
+                        else -> true
+                    }
+                }
                     .sortedWith(compareByDescending<ReviewItem> { if (it.labels.reviewed) -1 else it.check?.severity ?: 0 }.thenByDescending { it.labels.startedAt })
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Recordings", style = MaterialTheme.typography.titleLarge)
-                        Checkbox(flaggedOnly, { flaggedOnly = it })
-                        Text("Only ones that need a listen")
+                        listOf("flagged" to "Need a listen", "clipped" to "Clipped", "all" to "All").forEach { (k, label) ->
+                            FilterChip(selected = show == k, onClick = { show = k }, label = { Text(label) })
+                        }
+                        val pending = items.filter { isClipped(it) && it.labels.relearnRequestedAt == null }
+                        var confirmAll by remember { mutableStateOf(false) }
+                        if (show == "clipped" && pending.isNotEmpty()) {
+                            if (confirmAll) {
+                                TextButton(onClick = { confirmAll = false; WavPlayer.stop(); engine.relearnAllClipped() }) {
+                                    Text("Confirm: forget what ${pending.size} recordings taught", color = Color(0xFFFFD54F))
+                                }
+                                LaunchedEffect(Unit) { delay(5000); confirmAll = false }
+                            } else OutlinedButton(onClick = { confirmAll = true }) { Text("Relearn all ${pending.size} clipped") }
+                        }
                         Text(
                             (if (checking) "Checking… " else "") +
-                                "${items.count { (it.check?.severity ?: 0) >= 1 && !it.labels.reviewed }} flagged of ${items.size}",
+                                "${items.count { (it.check?.severity ?: 0) >= 1 && !it.labels.reviewed }} flagged · " +
+                                "${items.count(::isClipped)} clipped · of ${items.size}",
                             color = Color.Gray,
                         )
                     }
+                    Text(
+                        when (show) {
+                            "flagged" -> "These may have had the wrong song on screen. Play the recording (\"Play from slide\" jumps to where the slide went up). " +
+                                "If the song is right press \"Looks right\"; if not, press the suggested song or \"It's another song…\" — it is relearned as that song. " +
+                                "\"Delete\" removes a recording that is no use (it is moved to the deleted folder, not erased)."
+                            "clipped" -> "Recorded while the input was too hot. Listen at the \"worst at\" time to hear it."
+                            else -> "Every recording, newest first. \"Play intro\" plays the music held before the slide went up, which was learned as the intro."
+                        },
+                        style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                    )
+                    if (show == "clipped") Text(
+                        "Relearn forgets what a clipped recording taught (the recording is kept); the song is learned again " +
+                            "the next time it's played at the right level. Until then, a song with no other take won't be recognised.",
+                        style = MaterialTheme.typography.bodySmall, color = Color.Gray,
+                    )
                     webUrl?.let { Text("Also in a browser: $it", style = MaterialTheme.typography.bodySmall, color = Color.Gray) }
                     HorizontalDivider()
-                    if (shown.isEmpty()) Text(if (checking) "Checking recordings…" else "Nothing needs a listen.")
+                    if (shown.isEmpty()) Text(if (checking) "Checking recordings…" else if (show == "clipped") "No clipped recordings." else "Nothing needs a listen.")
                     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(shown, key = { it.name }) { ReviewRow(engine, it) }
                     }
@@ -86,6 +121,7 @@ private fun ReviewRow(engine: ListenerEngine, item: ReviewItem) {
     val isPlaying = playing == item.wav
     var picking by remember(item.name) { mutableStateOf(false) }
     var confirmDelete by remember(item.name) { mutableStateOf(false) }
+    var confirmRelearn by remember(item.name) { mutableStateOf(false) }
     val sev = item.check?.severity ?: 0
     val tint = when { l.reviewed -> Color(0xFF1E3A2A); sev >= 2 -> Color(0xFF4A1F1F); sev == 1 -> Color(0xFF3F3517); else -> Color(0xFF26262A) }
     Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = tint)) {
@@ -97,7 +133,8 @@ private fun ReviewRow(engine: ListenerEngine, item: ReviewItem) {
                         "${SimpleDateFormat("EEE d MMM HH:mm").format(Date(l.startedAt))} · ${l.origin ?: "import"} · " +
                             "%.0f s · slide up at %.0f s".format(l.endSeconds, l.goLiveSeconds) +
                             (l.relabelledFrom?.let { " · corrected from ${songlistener.core.SongKeys.labelOf(it) ?: it}" } ?: "") +
-                            (if (l.reviewed) " · ✓ reviewed" else ""),
+                            (if (l.reviewed) " · ✓ reviewed" else "") +
+                            (item.check?.introSeconds?.let { " · intro %.0f s (%.0f s like the song)".format(it, item.check.introMatchedSeconds ?: 0.0) } ?: ""),
                         style = MaterialTheme.typography.bodySmall, color = Color.LightGray,
                     )
                 }
@@ -108,6 +145,9 @@ private fun ReviewRow(engine: ListenerEngine, item: ReviewItem) {
                     TextButton(onClick = { WavPlayer.stop() }) { Text("Stop") }
                 } else {
                     TextButton(onClick = { WavPlayer.play(item.wav) }) { Text("Play") }
+                    item.check?.introSeconds?.let { intro ->
+                        TextButton(onClick = { WavPlayer.play(item.wav, maxOf(0.0, l.goLiveSeconds - intro - 2)) }) { Text("Play intro") }
+                    }
                     TextButton(onClick = { WavPlayer.play(item.wav, maxOf(0.0, l.goLiveSeconds - 2)) }) { Text("Play from slide") }
                 }
             }
@@ -122,6 +162,14 @@ private fun ReviewRow(engine: ListenerEngine, item: ReviewItem) {
                 if (!l.reviewed) OutlinedButton(onClick = { engine.markReviewed(item.name) }) { Text("Looks right") }
                 item.check?.rivalKey?.takeIf { (item.check.rivalScore ?: 0.0) >= 0.7 }?.let { rival ->
                     Button(onClick = { engine.relabel(item.name, rival) }) { Text("It's ${item.check.rivalLabel}") }
+                }
+                if (l.relearnRequestedAt == null && item.check?.flags?.any { it.code == "clipped" } == true) {
+                    if (confirmRelearn) {
+                        TextButton(onClick = { confirmRelearn = false; engine.relearn(item.name) }) {
+                            Text("Confirm relearn", color = Color(0xFFFFD54F))
+                        }
+                        LaunchedEffect(Unit) { delay(4000); confirmRelearn = false }
+                    } else OutlinedButton(onClick = { confirmRelearn = true }) { Text("Relearn (too hot)") }
                 }
                 OutlinedButton(onClick = { picking = !picking }) { Text(if (picking) "Cancel" else "It's another song…") }
                 if (confirmDelete) {

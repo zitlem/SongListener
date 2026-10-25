@@ -13,6 +13,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import songlistener.core.Clip
 import songlistener.core.ClipCutter
+import songlistener.core.ClipDetector
+import songlistener.core.ClipLevel
 import songlistener.core.LiveSong
 import songlistener.core.LyricsSnapshot
 import songlistener.core.ClipLabels
@@ -28,6 +30,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /** One recording in the review list: its file, labels, and — once checked — its flags. */
 data class ReviewItem(val name: String, val wav: File, val labels: ClipLabels, val check: ReviewCheck?)
+
+/**
+ * The incoming audio's level: [peakDb] of the last second (dBFS), and how many of the last
+ * [LevelState.WINDOW] seconds clipped. [clipping] means the input gain is too hot right now.
+ */
+data class LevelState(val peakDb: Double = -96.0, val clippedRecently: Int = 0) {
+    val clipping: Boolean get() = clippedRecently > 0
+    /** Within 1 dB of full scale without clipping: about as hot as it should go. */
+    val hot: Boolean get() = !clipping && peakDb > -1.0
+    companion object { const val WINDOW = 10 }
+}
 
 /** What the listener has learned about one song, for the library list. */
 data class LearnedSong(
@@ -46,10 +59,10 @@ data class LearnedSong(
  * thread, since the recognizer is not thread-safe; the UI only reads the published state flows.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
-class ListenerEngine(dataDir: File, private val config: Config = Config(), deviceId: String = "songlistener-unset") {
+class ListenerEngine(private val dataDir: File, private val config: Config = Config(), deviceId: String = "songlistener-unset") {
     private val worker = Dispatchers.Default.limitedParallelism(1)
     private val scope = CoroutineScope(SupervisorJob() + worker)
-    private val store = TakeStore(File(dataDir, "takes"), config.maxTakesPerSong)
+    private val store = TakeStore(File(dataDir, "takes"), config.maxTakesPerSong) { songlistener.core.TakeSelection.keep(it, config) }
     val logDir = File(dataDir, "logs")
     val reportDir = File(dataDir, "reports")
     private val log = EventLog(logDir)
@@ -61,16 +74,19 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
         config,
         onClip = { recorded ->
             val words = lyricsBySong[recorded.labels.songKey]
+            val level = ClipLevel.of(ClipDetector.analyze(recorded.samples, recorded.labels.sampleRate), config)
             val clip = Clip(
                 recorded.samples,
                 recorded.labels.copy(
                     origin = "live",
+                    level = level,
                     lyricsVersion = words?.first,
                     songbook = recorded.labels.songbook ?: words?.second,
                 ),
             )
             val file = clipStore.save(clip)
-            log.note("clip_saved", "${file.name} ${"%.0f".format(clip.labels.endSeconds)}s ${clip.labels.endReason}")
+            log.note("clip_saved", "${file.name} ${"%.0f".format(clip.labels.endSeconds)}s ${clip.labels.endReason}" +
+                if (level.severity > 0) " clipped ${level.clippedSeconds}s" else "")
             refreshClipStats()
         },
         onDropped = { song, reason -> log.note("clip_dropped", "${song.label}: $reason") },
@@ -80,6 +96,13 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
         onTakeSaved = { store.save(it) },
         onEvent = { log.record(it); cutter.onEvent(it) },
     )
+
+    /** Tuning's settings, recognition test and clipping check, shared by the app and the web page. */
+    val tuning = TuningJobs(this, config, File(dataDir, "config.json"), log)
+
+    private val _dismissedWrongSlide = MutableStateFlow<Long?>(null)
+    /** When the wrong-slide warning now dismissed was raised: hidden in the app and on the web page alike. */
+    val dismissedWrongSlide: StateFlow<Long?> = _dismissedWrongSlide
 
     val churchPresenter = ChurchPresenterClient(CoroutineScope(SupervisorJob() + Dispatchers.IO), deviceId = deviceId)
     val stt = SttClient()
@@ -92,6 +115,12 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
     /** Per song key: the songbook(s) a "Show it" can use — one when known, each edition when not. */
     private val _editions = MutableStateFlow<Map<String, List<String>>>(emptyMap())
     val editions: StateFlow<Map<String, List<String>>> = _editions
+
+    private val _level = MutableStateFlow(LevelState())
+    /** The incoming audio's level and whether it is clipping. */
+    val level: StateFlow<LevelState> = _level
+    /** Per second of the last [LevelState.WINDOW]: did it clip. Touched only on [worker]. */
+    private val recentClips = ArrayDeque<Boolean>()
 
     private val _clipStats = MutableStateFlow(clipStore.stats())
     /** Song recordings on disk: count, size, and count per song. */
@@ -112,9 +141,11 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
                 publish()
             }
         }
+        scope.launch { backfillTakeClipping() }
         scope.launch { stt.musicProb.collect { recognizer.onMusicProb(it); publish() } }
         scope.launch {
             stt.audio.collect {
+                measureLevel(it)
                 recognizer.onAudio(it)
                 // After the recognizer: events it raised for this chunk are stamped at its start.
                 cutter.onAudio(it, recognizer.state.isMusic)
@@ -123,20 +154,75 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
         }
     }
 
-    fun connect(churchPresenterUrl: String, apiKey: String, sttUrl: String) {
-        log.note("connect", "churchpresenter=$churchPresenterUrl stt=$sttUrl")
+    private fun measureLevel(chunk: ShortArray) {
+        val stats = ClipDetector.analyze(chunk, config.sampleRate, ClipDetector.LIVE_LEVEL)
+        recentClips.addLast(stats.clipRuns > 0)
+        while (recentClips.size > LevelState.WINDOW) recentClips.removeFirst()
+        val was = _level.value.clipping
+        _level.value = LevelState(stats.peakDb, recentClips.count { it })
+        if (_level.value.clipping != was) log.note(if (was) "clipping_stopped" else "clipping_started")
+    }
+
+    /**
+     * Takes learned before takes measured their own clipping get it from their recording, so the
+     * `best` take selection can prefer clean ones. Each is done once; later runs find nothing to do.
+     */
+    private suspend fun backfillTakeClipping() {
+        val updated = withContext(Dispatchers.IO) {
+            val missing = store.loadAll().filter { it.clipped == null }
+            if (missing.isEmpty()) return@withContext 0
+            val recordings = clipStore.labels().associateBy { (_, l) -> l.songKey to l.takeRecordedAt }
+            missing.count { take ->
+                val (wav, l) = recordings[take.songKey to take.recordedAt] ?: return@count false
+                val level = levelOf(wav, l) ?: return@count false
+                store.write(take.withClipped(level.clippedFraction))
+                true
+            }
+        }
+        if (updated > 0) {
+            log.note("takes_measured", "$updated take(s) given their recording's clipping")
+            recognizer.setTakes(store.loadAll())
+        }
+    }
+
+    fun connect(churchPresenterUrl: String, apiKey: String, sttUrl: String, from: String = "app") {
+        log.note("connect", "churchpresenter=$churchPresenterUrl stt=$sttUrl" + if (from != "app") " (from $from)" else "")
         churchPresenter.start(churchPresenterUrl, apiKey)
         stt.start(sttUrl)
     }
 
-    fun forget(songKey: String) {
+    fun forget(songKey: String, from: String = "app") {
         scope.launch {
-            log.note("song_forgotten", songKey)
+            log.note("song_forgotten", "$songKey (from $from)")
             recognizer.forget(songKey)
             // Its recordings go too: a song is usually forgotten because it was mislabelled.
             withContext(Dispatchers.IO) { store.delete(songKey); clipStore.delete(songKey) }
             refreshClipStats()
             publish()
+        }
+    }
+
+    /**
+     * Starts over: every take and recording is moved to `deleted/all-<time>/` (so it can be moved
+     * back) and nothing is recognised until songs are learned again.
+     */
+    fun forgetAll(from: String = "app") {
+        scope.launch {
+            val trash = File(dataDir, "deleted/all-" + java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd_HHmmss")))
+            val songs = recognizer.storedTakes().map { it.songKey }.distinct().size
+            withContext(Dispatchers.IO) {
+                synchronized(labelLock) {
+                    store.deleteAll(File(trash, "takes"))
+                    clipStore.deleteAll(File(trash, "clips"))
+                }
+            }
+            log.note("songs_forgotten_all", "$songs song(s), moved to ${trash.name} (from $from)")
+            recognizer.setTakes(emptyList())
+            reviewCache.clear()
+            refreshClipStats()
+            publish()
+            refreshReview()
         }
     }
 
@@ -152,6 +238,7 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
             cutter.finish("app_stopped")
         }
         scope.cancel()
+        tuning.shutdown()
         churchPresenter.stop()
         stt.stop()
         log.note("app_stopped")
@@ -175,16 +262,17 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
     }
 
     /** The operator dismissed a wrong-slide warning: recorded so the report can show what came of it. */
-    fun dismissed(w: WrongSlide) {
-        log.note("wrong_slide_dismissed", "${w.shown.key} heard=${w.heard.songKey}")
+    fun dismissed(w: WrongSlide, from: String = "app") {
+        _dismissedWrongSlide.value = w.at
+        log.note("wrong_slide_dismissed", "${w.shown.key} heard=${w.heard.songKey} (from $from)")
     }
 
     /** Asks ChurchPresenter to put [songKey] on screen, from [songbook] ("" = let it choose). */
-    fun show(songKey: String, songbook: String) {
+    fun show(songKey: String, songbook: String, from: String = "app") {
         val number = songKey.substringBefore('|').toIntOrNull() ?: 0
         val title = songKey.substringAfter('|')
         _showStatus.value = _showStatus.value + (songKey to "waiting")
-        log.note("show_requested", "$songKey" + if (songbook.isNotBlank()) " songbook=$songbook" else "")
+        log.note("show_requested", "$songKey" + (if (songbook.isNotBlank()) " songbook=$songbook" else "") + " (from $from)")
         scope.launch(Dispatchers.IO) {
             val result = churchPresenter.showSong(number, title, songbook.ifBlank { null })
             val status = when (result) {
@@ -223,6 +311,35 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
         }
     }
 
+    /** Held while a recording's labels are read and rewritten, so two writers never lose each other's change. */
+    private val labelLock = Any()
+
+    /**
+     * A recording's loudness and clipping: from its labels, or measured once and saved into them,
+     * so it is never measured again (not even after a restart).
+     */
+    private fun levelOf(wav: File, labels: ClipLabels): ClipLevel? {
+        labels.level?.let { return it }
+        val level = runCatching { ClipLevel.of(ClipDetector.analyze(ClipStore.readWav(wav), labels.sampleRate), config) }.getOrNull()
+            ?: return null
+        synchronized(labelLock) {
+            val fresh = clipStore.labelsOf(wav) ?: return level
+            if (fresh.level == null) runCatching { clipStore.update(wav, fresh.copy(level = level)) }
+        }
+        return level
+    }
+
+    /** Every recording's clipping, measuring (and saving) any not measured yet. Newest first. */
+    suspend fun clipScan(): List<ClipScan.Row> = withContext(Dispatchers.IO) {
+        clipStore.labels().reversed().mapNotNull { (wav, l) -> levelOf(wav, l)?.let { ClipScan.Row(wav.nameWithoutExtension, l, it) } }
+    }
+
+    /** Every recording with its audio, for a recognition test; [cleanOnly] leaves out clipped ones. */
+    suspend fun recordingsForTest(cleanOnly: Boolean): List<Pair<String, Clip>> = withContext(Dispatchers.IO) {
+        clipStore.labels().filter { (wav, l) -> !cleanOnly || (levelOf(wav, l)?.severity ?: 0) == 0 }
+            .mapNotNull { (wav, l) -> runCatching { wav.nameWithoutExtension to Clip(ClipStore.readWav(wav), l) }.getOrNull() }
+    }
+
     private val _reviews = MutableStateFlow<List<ReviewItem>>(emptyList())
     /** Every recording, newest first, with its flags once checked. */
     val reviews: StateFlow<List<ReviewItem>> = _reviews
@@ -250,7 +367,8 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
                     val l = item.labels
                     val take = takes.firstOrNull { it.songKey == l.songKey && it.recordedAt == l.takeRecordedAt }
                     val uncertain = runCatching { lyricsStore.latest(l.songKey, l.songbook)?.songbookCertain == false }.getOrDefault(false)
-                    val check = songlistener.core.ReviewFlags.check(l, take, takes, matcher, config, uncertain)
+                    val level = levelOf(item.wav, l)
+                    val check = songlistener.core.ReviewFlags.check(l, take, takes, matcher, config, uncertain, level)
                     reviewCache["$signature/${item.wav.name}"] = check
                     _reviews.value = _reviews.value.map { if (it.name == item.name) it.copy(check = check) else it }
                 }
@@ -293,11 +411,46 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
         clipStore.deleteOne(wav)
     }
 
+    /**
+     * The recording was too hot: drop the take learned from it, keep the recording, and let the
+     * song be learned afresh the next time it is played.
+     */
+    fun relearn(name: String, from: String = "app") = correct(name, "recording_relearn", from) { wav, l ->
+        store.deleteTake(l.songKey, l.takeRecordedAt)
+        clipStore.update(wav, l.copy(relearnRequestedAt = System.currentTimeMillis()))
+    }
+
+    /** [relearn] for every recording the review found clipped. */
+    fun relearnAllClipped(from: String = "app") {
+        scope.launch {
+            val names = _reviews.value.filter { item ->
+                item.labels.relearnRequestedAt == null && item.check?.flags?.any { it.code == "clipped" } == true
+            }.map { it.name }
+            if (names.isEmpty()) return@launch
+            withContext(Dispatchers.IO) {
+                for (name in names) {
+                    val wav = clipStore.find(name) ?: continue
+                    synchronized(labelLock) {
+                        val l = clipStore.labelsOf(wav) ?: return@synchronized
+                        store.deleteTake(l.songKey, l.takeRecordedAt)
+                        clipStore.update(wav, l.copy(relearnRequestedAt = System.currentTimeMillis()))
+                    }
+                }
+            }
+            log.note("recordings_relearn", "${names.size} clipped recording(s) (from $from)")
+            recognizer.setTakes(store.loadAll())
+            refreshClipStats()
+            publish()
+            refreshReview()
+        }
+    }
+
     private fun correct(name: String, event: String, from: String, action: (File, ClipLabels) -> Unit) {
         scope.launch {
             val wav = clipStore.find(name) ?: return@launch
-            val labels = clipStore.labels().firstOrNull { it.first == wav }?.second ?: return@launch
-            withContext(Dispatchers.IO) { action(wav, labels) }
+            val labels = withContext(Dispatchers.IO) {
+                synchronized(labelLock) { clipStore.labelsOf(wav)?.also { action(wav, it) } }
+            } ?: return@launch
             val (type, detail) = event.split(' ', limit = 2).let { it[0] to it.getOrNull(1) }
             log.note(type, "$name was ${labels.songKey}" + (detail?.let { " $it" } ?: "") + " (from $from)")
             recognizer.setTakes(store.loadAll())
@@ -318,7 +471,7 @@ class ListenerEngine(dataDir: File, private val config: Config = Config(), devic
     }
 
     private fun library(): List<LearnedSong> =
-        recognizer.allTakes().groupBy { it.songKey }.map { (key, takes) -> summarize(key, takes) }
+        recognizer.storedTakes().groupBy { it.songKey }.map { (key, takes) -> summarize(key, takes) }
             .sortedBy { it.label.lowercase() }
 
     private fun summarize(key: String, takes: List<SongTake>) = LearnedSong(

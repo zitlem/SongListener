@@ -1,0 +1,123 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>SongListener</title>
+<style>
+:root{color-scheme:dark;--bg:#121212;--card:#1e1e1e;--fg:#e6e6e6;--mut:#8a8a8a;--ok:#81c784;--warn:#ffd54f;--bad:#e57373;--line:#333;--accent:#9ecbff}
+*{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif}
+.bar{display:flex;flex-wrap:wrap;gap:12px 16px;align-items:center;margin-bottom:12px}
+.dot{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:6px;background:var(--bad)}.dot.on{background:#4caf50}
+progress{width:160px;height:10px;vertical-align:middle}
+.ban{background:#7f1d1d;border-radius:8px;padding:12px;margin-bottom:12px;display:none}
+.cols{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;align-items:start}
+@media(max-width:800px){.cols{grid-template-columns:1fr}}
+.card{background:var(--card);border-radius:10px;padding:12px;margin-bottom:12px}
+h2{margin:0 0 8px;font-size:16px;border-bottom:1px solid var(--line);padding-bottom:8px}
+.mut{color:var(--mut);font-size:13px}.big{font-size:22px}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+.row{margin:6px 0}.song{padding:6px 0;border-bottom:1px solid #2a2a2a;display:flex;gap:8px;align-items:center}.song>div{flex:1}.on-screen{font-weight:700}
+.cand progress{width:100%}
+a{color:var(--accent)}
+input{font:inherit;padding:6px 8px;border-radius:6px;border:1px solid var(--line);background:#161616;color:var(--fg);min-width:0}
+button{font:inherit;padding:6px 12px;border-radius:6px;border:1px solid var(--line);background:#2a2a2a;color:var(--fg);cursor:pointer}
+button.primary{background:#3f6fd8;border-color:#3f6fd8;color:#fff}button.amber{background:#8a6d1f;border-color:#8a6d1f;color:#fff}
+button.link{background:none;border:none;color:var(--accent);padding:4px 6px}button.danger{color:var(--bad)}
+.conn{display:grid;grid-template-columns:2fr 1fr 2fr auto;gap:8px;align-items:end}
+@media(max-width:800px){.conn{grid-template-columns:1fr}}
+label.f{display:flex;flex-direction:column;font-size:12px;color:var(--mut);gap:2px}
+.show{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}
+</style></head><body>
+
+<div class="card">
+ <div class="conn">
+  <label class="f">ChurchPresenter<input id="cpUrl"></label>
+  <label class="f">API key (optional)<input id="apiKey"></label>
+  <label class="f">STT server<input id="sttUrl"></label>
+  <button class="primary" onclick="connect()">Connect</button>
+ </div>
+ <div class="bar" style="margin:10px 0 0">
+  <a href="/logs">Logs</a> <a href="/report" target="_blank">Report</a> <a href="/tuning">Tuning</a>
+  <button id="reviewBtn" onclick="location.href='/review'">Review recordings</button>
+  <span id="restart" class="warn"></span>
+ </div>
+</div>
+
+<div class="bar"><span><i class="dot" id="cp"></i>ChurchPresenter <span id="cpErr" class="bad mut"></span></span>
+<span class="mut" id="web"></span>
+<label class="f" style="flex-direction:row;align-items:center;gap:6px">Port <input id="port" style="width:80px" inputmode="numeric"></label>
+<button class="link" id="portBtn" onclick="usePort()" style="display:none"></button></div>
+<div class="bar"><span><i class="dot" id="stt"></i>STT audio <span id="sttErr" class="bad mut"></span></span>
+<span>Music <progress id="mp" max="1" value="0"></progress> <span id="mpv"></span></span>
+<span>Level <span id="lvl" class="mut">–</span></span></div>
+<div class="bar" id="live"></div>
+<div class="row" id="take"></div>
+<div class="ban" id="wrong"></div>
+<div class="cols">
+<div class="card"><h2>Hearing</h2><div id="hearing"></div></div>
+<div class="card"><h2>Learned songs</h2><div id="lib"></div></div>
+</div>
+<script>
+const e=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const t=ms=>new Date(ms).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+// Only replace a part when it changed, so a button isn't swapped out from under a click.
+const last={};function set(el,html){if(last[el.id]!==html){last[el.id]=html;el.innerHTML=html}}
+async function post(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});if(!r.ok)alert(await r.text());return r}
+let settingsShown=false,state=null;
+function connect(){post('/api/control/connect',{churchPresenterUrl:cpUrl.value,apiKey:apiKey.value,sttUrl:sttUrl.value})}
+async function usePort(){const p=port.value;const r=await post('/api/control/webport',{port:p});if(r.ok)setTimeout(()=>location.href=location.protocol+'//'+location.hostname+':'+p+'/',1200)}
+function show(k,b){post('/api/control/show',{songKey:k,songbook:b})}
+function dismiss(){post('/api/control/dismiss')}
+function forgetAll(){if(confirm('Forget ALL learned songs and start fresh? Every take and recording is moved to the "deleted" folder, and nothing is recognised until songs are learned again.')&&confirm('Really forget all '+state.library.length+' songs?'))post('/api/control/forget-all')}
+function forget(k,label){if(confirm('Forget '+label+'? This deletes its takes and recordings for good.'))post('/api/control/forget',{songKey:k})}
+/** "Show it" buttons for a song, as in the app: one per songbook edition, then what ChurchPresenter answered. */
+function showButtons(sh,label){if(!sh)return'';label=label||'Show it';
+ let h='<div class="show">';
+ if(sh.status==='waiting')h+='<span class="mut">Waiting for approval in ChurchPresenter…</span>';
+ else if(!sh.books)h+='<button disabled>'+e(label)+'</button>';
+ else if(sh.books.length===1)h+='<button class="primary" data-k="'+e(sh.songKey)+'" data-b="'+e(sh.books[0])+'" onclick="show(this.dataset.k,this.dataset.b)">'+e(label)+'</button>';
+ else sh.books.forEach(b=>h+='<button class="primary" data-k="'+e(sh.songKey)+'" data-b="'+e(b)+'" onclick="show(this.dataset.k,this.dataset.b)">'+e(label)+' ('+e(b.split('/').pop().slice(-18))+')</button>');
+ if(sh.status==='shown')h+='<span class="ok">✓ Shown</span>';
+ else if(sh.status==='declined')h+='<span class="bad">Declined in ChurchPresenter</span>';
+ else if(sh.status&&sh.status.startsWith('failed'))h+='<span class="bad mut">'+e(sh.status.replace('failed: ',''))+'</span>';
+ return h+'</div>'}
+function render(s){state=s;
+ const st=s.settings;
+ if(!settingsShown||![cpUrl,apiKey,sttUrl].includes(document.activeElement)&&!document.body.dataset.dirty){
+  cpUrl.value=st.churchPresenterUrl;apiKey.value=st.apiKey;sttUrl.value=st.sttUrl;if(document.activeElement!==port)port.value=st.webPort;settingsShown=true}
+ const pv=parseInt(port.value);const okPort=pv>=1024&&pv<=65535;
+ portBtn.style.display=(okPort&&pv!==st.webPort)?'':'none';portBtn.textContent='Use port '+pv;
+ web.innerHTML=st.webUrls.map(u=>'<a href="'+e(u)+'">'+e(u)+'</a>').join(' ');
+ restart.textContent=st.restartNeeded?'Tuning settings saved — restart SongListener to use them':'';
+ const rv=s.review,n=[rv.flagged&&rv.flagged+' flagged',rv.clipped&&rv.clipped+' clipped'].filter(Boolean);
+ reviewBtn.textContent='Review recordings'+(n.length?' ('+n.join(' · ')+')':'');reviewBtn.className=n.length?'amber':'';
+ cp.className="dot"+(s.cpConnected?" on":"");stt.className="dot"+(s.sttConnected?" on":"");
+ cpErr.textContent=!s.cpConnected&&s.cpError?s.cpError.slice(0,120):'';sttErr.textContent=!s.sttConnected&&s.sttError?s.sttError.slice(0,120):'';
+ mp.value=s.musicProb;mpv.textContent=s.musicProb.toFixed(2);
+ lvl.className=s.clipping?"bad":s.hot?"warn":"ok";
+ lvl.textContent=(s.peakDb>-96?s.peakDb.toFixed(1)+" dBFS":"–")+(s.clipping?" · CLIPPING ("+s.clippedRecently+" of last 10 s) — turn the input down":"");
+ const sc=s.slideCheck, cls={ok:"ok",wrong:"bad",doubt:"warn"}[sc&&sc.kind]||"mut";
+ set(live,"<b>"+(s.live?"On screen: "+e(s.live):"On screen: nothing (listening for songs)")+"</b>"+
+  (sc?'<span class="'+cls+'">Slide check: '+e(sc.text)+'</span>':"")+
+  (s.accuracy.runs?'<span class="mut">Slide checks this session: '+s.accuracy.top1+' of '+s.accuracy.runs+' matched</span>':""));
+ const tk=s.take;
+ set(take,'<span class="mut">'+(s.live?'Recording take: '+tk.songSeconds+'s of music'+(tk.introSeconds?' + '+tk.introSeconds+'s intro':'')+(tk.songSeconds<tk.neededSeconds?' (kept once it reaches '+tk.neededSeconds+'s)':' ✓ will be kept')
+  :(tk.heldSeconds?'Holding '+tk.heldSeconds+'s of music as the intro of whatever goes live next':'No music held for an intro'))+' · Query window: '+s.queryFrames+'/'+s.queryNeeded+' frames</span>');
+ wrong.style.display=s.wrongSlide?"block":"none";
+ if(s.wrongSlide){const w=s.wrongSlide;set(wrong,"<b>Wrong slide?</b> Music sounds like "+e(w.heard)+" ("+w.heardScore.toFixed(2)+") — screen shows "+e(w.shown)+" ("+w.shownScore.toFixed(2)+")"+
+  '<div class="show">'+showButtons(w.show,'Show '+w.heard.split(' ')[0])+'<button onclick="dismiss()">Dismiss</button></div>')}
+ let h="";
+ if(s.cantCheckLive&&s.live)h+='<div class="mut">Can\'t check the slide: this song hasn\'t been learned yet.</div>';
+ if(s.suggested)h+='<div class="mut">Suggested</div><div class="big ok">'+e(s.suggested.label)+'</div>'+(s.suggested.section?'<div>Band is at: '+e(s.suggested.section)+'</div>':'')+'<div class="mut">score '+s.suggested.score.toFixed(2)+' · '+t(s.suggested.at)+'</div>'+showButtons(s.suggestedShow);
+ if(s.hint)h+='<div class="mut" style="margin-top:8px">Sounds like… (early guess)</div><div class="big warn">'+e(s.hint.label)+'</div><div class="mut">score '+s.hint.score.toFixed(2)+' · '+t(s.hint.at)+'</div>'+showButtons(s.hintShow);
+ const c=s.candidates;
+ if(!c||!c.ranked.length)h+='<div class="row">Listening — needs '+Math.round(s.neededSeconds)+'s of continuous music and at least one learned song.</div>';
+ else{h+='<div class="mut" style="margin-top:8px">Top candidates (margin '+c.margin.toFixed(2)+')</div>';
+  c.ranked.forEach(r=>{h+='<div class="row cand"><div>'+e(r.label)+(r.onScreen?" · on screen":"")+'</div><progress max="1" value="'+Math.max(0,r.score)+'"></progress> '+r.score.toFixed(2)+'<div class="mut">key '+(r.key>0?"+":"")+r.key+' · tempo ×'+r.tempo.toFixed(2)+' · at '+r.at+'s'+(r.section?' · '+e(r.section):'')+'</div></div>'})}
+ set(hearing,h);
+ const r=s.recordings;
+ set(lib,'<div class="mut">Recordings: '+r.imported+' imported · '+r.live+' live · '+Math.round(r.bytes/1e6)+' MB'+(s.library.length||r.imported+r.live?' · <button class="link danger" onclick="forgetAll()">Forget all…</button>':'')+'</div>'+
+  (s.library.length?s.library.map(x=>'<div class="song"><div><div class="'+(x.onScreen?"on-screen":"")+'">'+e(x.label)+'</div><div class="mut">'+x.takes+' take(s) · '+x.imported+' imported · '+x.live+' live · '+x.seconds+'s · '+t(x.lastRecorded)+'</div></div>'+
+   '<button class="link danger" data-k="'+e(x.key)+'" data-l="'+e(x.label)+'" onclick="forget(this.dataset.k,this.dataset.l)">Forget</button></div>').join(""):"<div>Nothing learned yet. Put a song on screen in ChurchPresenter while the band plays for 30s or more.</div>"));
+}
+[cpUrl,apiKey,sttUrl].forEach(i=>i.addEventListener('input',()=>document.body.dataset.dirty='1'));
+document.querySelector('.conn button').addEventListener('click',()=>delete document.body.dataset.dirty);
+async function tick(){try{render(await (await fetch("/api/state")).json())}catch(_){cp.className=stt.className="dot"}}
+tick();setInterval(tick,1000);
+</script></body></html>

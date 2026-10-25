@@ -16,7 +16,8 @@ button.primary{background:var(--accent);border-color:var(--accent);color:#fff}bu
 </style></head><body><main>
 <p><a href="/">← SongListener</a></p><h1>Review recordings</h1>
 <p class=muted>Listen, and correct any recording whose song was wrong on screen. A correction relabels the recording and re-learns it as the right song.</p>
-<div class=bar><label><input type=checkbox id=only checked style="width:auto;margin:0"> Only ones that need a listen</label><span id=count class=muted></span></div>
+<div class=bar><label>Show <select id=only style="font:inherit;padding:4px 8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg)"><option value=flagged>Ones that need a listen</option><option value=clipped>Clipped (input too hot)</option><option value=all>All</option></select></label><span id=count class=muted></span><button id=relearnAll style="display:none" onclick="relearnAll()"></button></div>
+<p id=help class=muted style="font-size:13px"></p>
 <div id=list></div></main>
 <script>
 const q=(p)=>p;
@@ -25,28 +26,41 @@ async function load(){data=await (await fetch(q('/api/recordings'))).json();rend
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function fmt(t){return new Date(t).toLocaleString([], {weekday:'short',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})}
 function render(){
-  const only=document.getElementById('only').checked;
+  const show=document.getElementById('only').value;
   const flagged=data.filter(r=>r.severity>=1&&!r.reviewed);
-  document.getElementById('count').textContent=flagged.length+' flagged of '+data.length+(data.some(r=>!r.checked)?' · checking…':'');
-  const rows=(only?flagged:data).slice().sort((a,b)=>((b.reviewed?-1:b.severity)-(a.reviewed?-1:a.severity))||b.startedAt-a.startedAt);
+  const clipped=data.filter(r=>r.flags.some(f=>f.code=='clipped'));
+  document.getElementById('count').textContent=flagged.length+' flagged · '+clipped.length+' clipped · of '+data.length+(data.some(r=>!r.checked)?' · checking…':'');
+  document.getElementById('help').textContent={
+   flagged:'These may have had the wrong song on screen. Play the recording ("Play from slide" jumps to where the slide went up). If the song is right press "Looks right"; if not, press the suggested song or "It\'s another song…" and it is relearned as that song. "Delete" removes a recording that is no use (moved to the deleted folder, not erased).',
+   clipped:'Recorded while the input was too hot. Listen at the "worst at" time to hear it. Once the gain is fixed and the song has been recorded cleanly, "Relearn" forgets what a clipped recording taught (the recording is kept) so the song is learned again from clean audio.',
+   all:'Every recording, newest first. "Play intro" plays the music held before the slide went up, which was learned as the intro.'}[show];
+  const pending=clipped.filter(r=>!r.relearnRequested);
+  const ra=document.getElementById('relearnAll');ra.style.display=show=='clipped'&&pending.length?'':'none';ra.textContent='Relearn all '+pending.length+' clipped';
+  const rows=({flagged,clipped,all:data}[show]).slice().sort((a,b)=>((b.reviewed?-1:b.severity)-(a.reviewed?-1:a.severity))||b.startedAt-a.startedAt);
   document.getElementById('list').innerHTML=rows.length?rows.map(r=>`
    <div class="rec ${r.reviewed?'done':'s'+r.severity}" data-name="${esc(r.name)}">
     <div class=title>${esc(r.song)}</div>
-    <div class="meta muted">${fmt(r.startedAt)} · ${esc(r.origin)} · ${Math.round(r.seconds)} s · slide up at ${Math.round(r.slideAt)} s${r.relabelledFrom?' · corrected from '+esc(r.relabelledFrom):''}${r.reviewed?' · ✓ reviewed':''}</div>
+    <div class="meta muted">${fmt(r.startedAt)} · ${esc(r.origin)} · ${Math.round(r.seconds)} s · slide up at ${Math.round(r.slideAt)} s${r.relabelledFrom?' · corrected from '+esc(r.relabelledFrom):''}${r.reviewed?' · ✓ reviewed':''}${r.introSeconds?` · intro ${Math.round(r.introSeconds)} s (${Math.round(r.introMatchedSeconds)} s like the song)`:''}</div>
     ${r.checked?r.flags.map(f=>`<div class="flag s${f.severity}">⚑ ${esc(f.text)}</div>`).join(''):'<div class=muted>Checking…</div>'}
     <audio controls preload=none src="${q('/audio/'+encodeURIComponent(r.name))}"></audio>
     <div class=actions>
+      ${r.introSeconds?`<button onclick="seek(this,${Math.max(0,r.slideAt-r.introSeconds-2)})" title="Music held before the slide and learned as the intro">Play intro</button>`:''}
       <button onclick="seek(this,${Math.max(0,r.slideAt-2)})">Play from slide</button>
       ${r.reviewed?'':'<button onclick="act(this,\'reviewed\')">Looks right</button>'}
-      ${r.rivalKey&&r.rivalScore>=0.7?`<button class=primary onclick="relabel(this,'${esc(r.rivalKey)}')">It's ${esc(r.rivalLabel)}</button>`:''}
+      ${r.rivalKey&&r.rivalScore>=0.7?`<button class=primary data-k="${esc(r.rivalKey)}" onclick="relabel(this,this.dataset.k)">It's ${esc(r.rivalLabel)}</button>`:''}
+      ${r.flags.some(f=>f.code=='clipped')&&!r.relearnRequested?'<button onclick="relearn(this)" title="Forget what was learned from this recording (it is kept); the song is learned again the next time it is played">Relearn (too hot)</button>':''}
       <button onclick="pick(this)">It's another song…</button>
       <button class=danger onclick="del(this)">Delete</button>
-    </div><div class=picker></div></div>`).join(''):'<p class=muted>Nothing needs a listen.</p>';
+    </div><div class=picker></div></div>`).join(''):(show=='clipped'?'<p class=muted>No clipped recordings'+(data.some(r=>!r.checked)?' found yet — still checking.':'.')+'</p>':'<p class=muted>Nothing needs a listen.</p>');
 }
 const nameOf=b=>b.closest('.rec').dataset.name;
 function seek(b,t){const a=b.closest('.rec').querySelector('audio');a.currentTime=t;a.play()}
 async function post(name,action,body){await fetch(q('/api/recordings/'+encodeURIComponent(name)+'/'+action),{method:'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):''});setTimeout(load,800)}
 function act(b,a){post(nameOf(b),a)}
+function relearn(b){if(confirm('Forget what was learned from this recording? The recording is kept, and the song is learned again the next time it is played — until then, if this was its only take, it won\'t be recognised.'))post(nameOf(b),'relearn')}
+async function relearnAll(){const n=data.filter(r=>r.flags.some(f=>f.code=='clipped')&&!r.relearnRequested).length;
+ if(!confirm('Forget what was learned from all '+n+' clipped recordings? The recordings are kept. Songs learned only from them won\'t be recognised until they are played again at the right level.'))return;
+ await fetch(q('/api/recordings/relearn-clipped'),{method:'POST'});setTimeout(load,1500)}
 function relabel(b,k){post(nameOf(b),'relabel',{songKey:k})}
 function del(b){if(confirm('Remove this recording and what was learned from it? (It is moved to the "deleted" folder, not erased.)'))post(nameOf(b),'delete')}
 function pick(b){const p=b.closest('.rec').querySelector('.picker');p.innerHTML='<input placeholder="Number or title" autofocus><div class=hits></div>';

@@ -21,7 +21,12 @@ class SongTake(
     val recordedAt: Long,
     val frames: List<FloatArray>,
     val sectionMarks: List<SectionMark>,
+    /** Share of its seconds that clipped (input too hot), null if not measured. */
+    val clipped: Double? = null,
 ) {
+    /** The same take with [clipped] set. */
+    fun withClipped(value: Double?) = SongTake(songKey, songLabel, recordedAt, frames, sectionMarks, value)
+
     /** The section on screen at [frame]: the last mark at or before it, or null if there is none. */
     fun sectionAt(frame: Int): Int? = sectionMarks.lastOrNull { it.frame <= frame }?.section
 

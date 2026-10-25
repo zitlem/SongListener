@@ -14,6 +14,11 @@ data class Config(
     val framesPerFeature: Int = 5,
     /** RMS (0..1 of full scale) below which a raw frame counts as silence. */
     val silenceRms: Double = 0.003,
+    /** A recording with clip runs (see `ClipDetector`) in at least this many seconds is worth a listen. */
+    val clipLightSeconds: Int = 3,
+    /** Heavily clipped: clip runs in at least this many seconds, and this share of all its seconds. */
+    val clipHeavySeconds: Int = 10,
+    val clipHeavyFraction: Double = 0.02,
 
     /** The quick listener's window, in stored frames (24 = 12 s): early "sounds like…" hints. */
     val queryFrames: Int = 24,
@@ -40,12 +45,42 @@ data class Config(
     val maxTakeFrames: Int = 1200,
     val maxTakesPerSong: Int = 5,
     /**
+     * Which takes a song keeps beyond [maxTakesPerSong]: `newest`, or `best` (unclipped first, then
+     * the one agreeing most with the song's other takes, then the newest; see `TakeSelection`).
+     */
+    val keepTakes: String = "newest",
+    /**
+     * How much a song's score leans on its second-best take: 0 scores by the best take alone, 0.5 by
+     * the mean of the best two. Above 0, a song wins by several of its performances matching, not one
+     * by luck. Songs with one take are scored as before. Off until replay on clean recordings shows it helps.
+     */
+    val takeAgreement: Double = 0.0,
+    /**
      * Music heard while nothing is on screen, held so it can become the intro of the next song
      * that goes live (180 = 90 s).
      */
     val lookbackFrames: Int = 180,
     /** A break without music longer than this clears the look-back: that music was something else. */
     val lookbackMaxGapSeconds: Double = 20.0,
+    /**
+     * What of a take's intro is matched on: `keep` all the held music, `match` only the end of it
+     * that sounds like the song (see `IntroFilter`), or `drop` it. Takes are stored whole either way.
+     */
+    val introMode: String = "match",
+    /** For `match`: how well a 12 s stretch of intro must match the song, in its key and tempo, to be kept. */
+    val introMatchScore: Double = 0.6,
+    /**
+     * Search only the parts of a song that at least two of its performances share (see
+     * `ConfirmedParts`). Off until replay, with songs recorded three or more times, shows it helps.
+     */
+    val confirmedParts: Boolean = false,
+    /**
+     * For [confirmedParts]: how well a 12 s stretch must match another performance to count as
+     * shared. Measured 2026-10-11 on 12 s stretches of the takes: the same song's other take scored
+     * median 0.70 (p10 0.55, p90 0.81), the best of 8 other songs median 0.58 (p90 0.66). At 0.70
+     * half of the real song was dropped; 0.65 drops mostly what is clearly something else.
+     */
+    val confirmScore: Double = 0.65,
 
     /** Seconds of audio between two matcher runs. */
     val matchIntervalSeconds: Double = 2.0,

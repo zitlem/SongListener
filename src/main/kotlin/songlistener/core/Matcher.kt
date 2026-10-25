@@ -38,11 +38,22 @@ class Matcher(private val config: Config = Config()) {
     fun match(query: List<FloatArray>, takes: List<SongTake>): MatchResult {
         if (query.isEmpty()) return MatchResult(emptyList())
         val queryProfile = sumProfile(query)
-        val bestPerSong = HashMap<String, SongScore>()
+        // Per song, the best alignment from each recording (a take may be split into pieces that
+        // share its recording time; they count as one performance).
+        val perRecording = HashMap<String, HashMap<Long, SongScore>>()
         for (take in takes) {
             val best = bestAlignment(query, queryProfile, take) ?: continue
-            val current = bestPerSong[take.songKey]
-            if (current == null || best.score > current.score) bestPerSong[take.songKey] = best
+            val byRec = perRecording.getOrPut(take.songKey) { HashMap() }
+            val current = byRec[take.recordedAt]
+            if (current == null || best.score > current.score) byRec[take.recordedAt] = best
+        }
+        val bestPerSong = HashMap<String, SongScore>()
+        for ((k, byRec) in perRecording) {
+            val ranked = byRec.values.sortedByDescending { it.score }
+            val b = ranked.first()
+            val second = ranked.getOrNull(1)
+            bestPerSong[k] = if (config.takeAgreement > 0 && second != null)
+                b.copy(score = b.score - config.takeAgreement * (b.score - second.score)) else b
         }
         if (config.cohort && bestPerSong.size > 1) {
             val bias = Cohort.biases(this, takes, query.size)

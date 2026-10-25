@@ -16,7 +16,20 @@ data class AppSettings(
     val deviceId: String = "",
     /** The port the web page (phone / sound desk view and the review page) is served on. */
     val webPort: Int = 8780,
+    /** Matching settings, set in the Tuning window and used from the next start (see `Config`). */
+    val keepTakes: String = "newest",
+    val maxTakesPerSong: Int = 5,
+    val takeAgreement: Double = 0.0,
+    val introMode: String = "match",
+    val confirmedParts: Boolean = false,
 ) {
+    /** [base] with these matching settings. */
+    fun applyTo(base: songlistener.core.Config) = base.copy(
+        keepTakes = keepTakes, maxTakesPerSong = maxTakesPerSong.coerceIn(1, 20), takeAgreement = takeAgreement.coerceIn(0.0, 1.0),
+        confirmedParts = confirmedParts,
+        introMode = introMode.takeIf { it in listOf("keep", "match", "drop") } ?: base.introMode,
+    )
+
     companion object {
         private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
 

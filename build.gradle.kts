@@ -60,7 +60,7 @@ tasks.register<JavaExec>("replay") {
     description = "Leave-one-out replay of every saved song recording, e.g. ./gradlew replay -PsuggestScore=0.75"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("songlistener.io.ReplayMainKt")
-    listOf("suggestScore", "suggestMargin", "suggestStreak", "queryFrames", "musicDipToleranceSeconds", "tempoStretches", "feature", "framesPerFeature", "transpose", "steadyFrames", "steadyScore", "steadyMargin", "wrongSlideMargin", "wrongSlideMinScore", "cohort", "origin").forEach { name ->
+    listOf("suggestScore", "suggestMargin", "suggestStreak", "queryFrames", "musicDipToleranceSeconds", "tempoStretches", "feature", "framesPerFeature", "transpose", "steadyFrames", "steadyScore", "steadyMargin", "wrongSlideMargin", "wrongSlideMinScore", "cohort", "origin", "clean", "maxTakesPerSong", "keepTakes", "takeAgreement", "introMode", "introMatchScore", "confirmedParts", "confirmScore").forEach { name ->
         project.findProperty(name)?.let { systemProperty("songlistener.$name", it.toString()) }
     }
 }
@@ -74,4 +74,11 @@ tasks.register<JavaExec>("importService") {
     listOf("wav", "db", "cpLogs", "playLog", "songCache", "source", "music", "seedTakes", "includeUnusual", "includeAll", "dryRun").forEach { name ->
         project.findProperty(name)?.let { systemProperty("songlistener.$name", it.toString()) }
     }
+}
+
+tasks.register<JavaExec>("scanClipping") {
+    group = "application"
+    description = "Checks every saved song recording for clipping and prints them worst first. Reads only."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("songlistener.io.ClipScanMainKt")
 }

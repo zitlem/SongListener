@@ -1,0 +1,111 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>SongListener Tuning</title>
+<style>
+:root{color-scheme:dark;--bg:#121212;--card:#1e1e1e;--fg:#e6e6e6;--mut:#8a8a8a;--ok:#81c784;--warn:#ffd54f;--bad:#e57373;--line:#333;--accent:#9ecbff}
+*{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif}
+main{max-width:980px;margin:0 auto}a{color:var(--accent)}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;border-bottom:1px solid var(--line);padding-bottom:12px}
+.chip{padding:6px 12px;border-radius:8px;border:1px solid var(--line);background:none;color:var(--fg);cursor:pointer;font:inherit}
+.chip.on{background:#3a4a6b;border-color:#5a73a8}
+.help{color:var(--mut);font-size:13px;margin:4px 0 8px}
+h3{margin:18px 0 4px;font-size:15px}
+button{font:inherit;padding:6px 12px;border-radius:6px;border:1px solid var(--line);background:#2a2a2a;color:var(--fg);cursor:pointer}
+button.primary{background:#3f6fd8;border-color:#3f6fd8;color:#fff}button:disabled{opacity:.5;cursor:default}
+button.link{background:none;border:none;color:var(--accent)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+.step{display:flex;gap:10px;align-items:flex-start;margin:10px 0}.step .i{width:18px;font-size:18px}.step .b{flex:1}
+table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:6px 8px;text-align:left;border-bottom:1px solid #2a2a2a;vertical-align:top}
+th{color:var(--mut);font-weight:600}tr.best td{color:var(--ok)}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:13px}
+progress{width:100%;height:10px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+</style></head><body><main>
+<p><a href="/">← SongListener</a></p><h1 style="margin:0">Tuning</h1>
+<div class="tabs" id="tabs"></div>
+<div id="view"></div>
+</main>
+<script>
+const e=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const TABS=[["guide","Guide"],["matching","Matching settings"],["test","Test recognition"],["clipping","Clipping"]];
+let tab=(location.hash||'#guide').slice(1),data=null,edit=null,dirty=false;
+async function post(p,b){const r=await fetch('/api/tuning/'+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});if(!r.ok)alert(await r.text());await load()}
+const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+const summary=m=>m.keepTakes+', '+m.maxTakes+' takes, agreement '+(m.agreement?m.agreement.toFixed(1):'off')+', intro '+m.intro+(m.confirmed?', confirmed parts':'');
+function go(t){tab=t;location.hash=t;render()}
+function chip(on,label,click){return '<button class="chip'+(on?' on':'')+'" onclick="'+click+'">'+e(label)+'</button>'}
+function step(state,title,text,action){
+ return '<div class="step"><div class="i '+({ok:'ok',todo:'warn'}[state]||'bad')+'">'+({ok:'✓',todo:'●'}[state]||'!')+'</div><div class="b"><b>'+e(title)+'</b><div class="help">'+e(text)+'</div></div>'+
+  (action?'<button onclick="go(\''+action[1]+'\')">'+e(action[0])+'</button>':'')+'</div>'}
+
+function guide(){const g=data.guide;let h='<h2>What to do now</h2>';
+ if(!g.sttConnected)h+=step('todo','Connect to the STT server','No audio is coming in, so the input level can\'t be checked. Connect on the main page.');
+ else if(g.clipping)h+=step('bad','Turn the input down — it is clipping now','The audio is too hot: loud parts are cut off flat, which distorts what the listener learns. Lower the gain on the mixer or the STT server until the main page\'s Level stays out of red during the loudest song.');
+ else if(g.hot)h+=step('todo','Input is close to clipping','Peaks are within 1 dB of the maximum. Lower the gain a little: aim for peaks around −6 to −3 dBFS.');
+ else h+=step('ok','Input level is fine','No clipping right now. Watch the Level on the main page during the loudest song of a service.');
+ h+=g.clipped?step('todo',g.clipped+' recording(s) were clipped','Recorded while the input was too hot (from 13 Sep). They still help recognition, so keep them for now. Once the gain is fixed and a song has been recorded cleanly, relearn its clipped recordings: Review recordings → Clipped → Relearn. Check day by day in the Clipping tab.',['Clipping','clipping'])
+  :step('ok','No clipped recordings waiting','Nothing recorded too hot is being learned from.');
+ if(g.flagged)h+=step('todo',g.flagged+' recording(s) need a listen','The listener thinks these may have had the wrong song on screen. Listen and press Looks right, or correct the song, in Review recordings (button on the main page).');
+ h+=step(g.thrice>=5?'ok':'todo','Songs recorded more than once: '+g.twice+' (three or more times: '+g.thrice+')','Recognition — and the test that tunes it — improves as songs are played again: every play adds a take. '+(g.thrice>=5?'There are enough repeats to run Test recognition.':'Run Test recognition after a few more services; until then its numbers are too small to trust.'),['Test recognition','test']);
+ if(!same(data.saved,data.running))h+=step('bad','Restart SongListener','Matching settings were saved but take effect only after a restart.');
+ h+='<hr style="border-color:#333"><h2>How it works</h2>'+
+ '<p class="help">Listening: audio comes from the STT server. When music plays while a song\'s slide is on screen, the listener learns that song from it (a "take", kept once it has 30 s of music) and saves a recording. Music before the slide goes up is kept as the intro.</p>'+
+ '<p class="help">Recognising: music is compared with every song\'s takes. With nothing on screen it suggests the song ("Sounds like…"); with a slide up it checks it is the right one and warns if another song fits better ("Wrong slide?").</p>'+
+ '<p class="help">Review recordings: listen to recordings and correct any learned under the wrong song, delete bad ones, and relearn clipped ones. Corrections change what is learned straight away.</p>'+
+ '<p class="help">Tuning: Matching settings change how songs are matched; Test recognition measures the settings on your own recordings so you can pick the best; Clipping shows, day by day, whether the input was too hot. Measurements are remembered, so checks are quick.</p>';
+ return h}
+
+function setE(k,v){edit[k]=v;dirty=!same(edit,data.saved);render()}
+function matching(){const m=edit;let h='<p class="help">How the listener recognises songs. Each time a song is played, what was heard is kept as a "take"; music is matched against every song\'s takes. These settings change which takes are kept and how they are matched. Change them only after "Test recognition" shows a setting does better on your recordings, then Save and restart SongListener.</p>';
+ h+='<h3>Which takes a song keeps</h3><div class="help">When a song has more takes than the limit below, one has to go. Newest drops the oldest. Best drops a clipped take first (input too hot), then one that sounds unlike the song\'s other takes (often a wrong slide), so a good old take isn\'t lost just for being old. Try Best once songs have several clean takes.</div><div class="row">'+
+  chip(m.keepTakes!=='best','Newest',"setE('keepTakes','newest')")+chip(m.keepTakes==='best','Best — unclipped first, then the ones that agree with each other',"setE('keepTakes','best')")+'</div>';
+ h+='<h3>Intro — music heard before the slide went up</h3><div class="help">Music playing before a song\'s slide goes up is learned as its intro, so the song can be recognised early. But it isn\'t always the intro: another performance before the song gets held too. "Only what sounds like the song" (recommended) keeps the part that matches the song, or that has come before it in another performance. "All" learns everything held; "None" never learns an intro. Check what was learned with "Play intro" in Review recordings.</div><div class="row">'+
+  [["match","Only what sounds like the song"],["keep","All held music"],["drop","None"]].map(([k,l])=>chip(m.intro===k,l,"setE('intro','"+k+"')")).join('')+'</div>';
+ h+='<h3>Takes per song</h3><div class="row"><button onclick="setE(\'maxTakes\','+Math.max(1,m.maxTakes-1)+')">−</button><b>'+m.maxTakes+'</b><button onclick="setE(\'maxTakes\','+Math.min(20,m.maxTakes+1)+')">+</button>'+
+  '<span class="help">More takes cover more ways a song gets played (tempo, key, who leads); matching takes a little longer. 5 is a good start.</span></div>';
+ h+='<h3>Search only the parts performances share</h3><div class="help">For a song recorded more than once: compare its takes and search only the stretches that appear in at least two of them, leaving out what happened only once (talking, applause, a solo, other music). Mainly cuts wrong suggestions and false wrong-slide warnings. Songs with one recording aren\'t affected. Turn on once Test recognition shows it helps — that needs songs recorded three or more times.</div><div class="row">'+
+  chip(!m.confirmed,'Off — search whole takes',"setE('confirmed',false)")+chip(m.confirmed,'On — shared parts only',"setE('confirmed',true)")+'</div>';
+ h+='<h3>Agreement between takes: '+(m.agreement?m.agreement.toFixed(1):'off')+'</h3><div class="help">Off scores a song by its single best-matching take. At 0.5 it uses the average of its best two, so a song wins because several of its performances match, not one by luck. Songs with one take are unaffected. Try 0.5 in Test recognition once many songs have two or more takes.</div>'+
+  '<input type="range" min="0" max="1" step="0.1" value="'+m.agreement+'" style="width:420px;max-width:100%" onchange="setE(\'agreement\',parseFloat(this.value))">';
+ const status=dirty?'Not saved yet.':(!same(data.saved,data.running)?'Saved. Restart SongListener to use these settings.':'In use.');
+ h+='<div class="row" style="margin-top:16px"><button class="primary" '+(dirty?'':'disabled')+' onclick="post(\'settings\',edit).then(()=>{dirty=false;edit=null;render()})">Save</button>'+
+  (dirty?'<button class="link" onclick="dirty=false;edit=null;render()">Undo changes</button>':'')+'<span class="'+(!dirty&&!same(data.saved,data.running)?'warn':'mut')+'">'+status+'</span></div>'+
+  '<p class="help">Use "Test recognition" to see which settings recognise your recordings best before changing them.</p>';
+ return h}
+
+let cleanOnly=null;
+function test(){const t=data.test;if(cleanOnly===null)cleanOnly=t.cleanOnly;
+ let h='<p class="help">What it does: plays every saved recording back as if live, against what was learned from the other recordings, once for each setting below, and counts how often the right song was found. How to use: run it when no service is on (a few minutes, heavy on the CPU). Keep "Clean recordings only" ticked so clipped audio doesn\'t skew it. A song counts only if it has been recorded at least twice, so results get trustworthy as songs repeat — aim for 10+ tested. Pick the green row and press "Use these", then restart. A test started here also shows in the app, and the other way round.</p>';
+ h+='<div class="row"><label><input type="checkbox" '+(cleanOnly?'checked':'')+(t.running?' disabled':'')+' onchange="cleanOnly=this.checked"> Clean recordings only (leave out clipped ones)</label>'+
+  (t.running?'<button onclick="post(\'test/stop\')">Stop</button>':'<button class="primary" onclick="post(\'test\',{cleanOnly})">Run test</button>')+'</div>';
+ if(t.running)h+='<progress max="1" value="'+t.progress+'"></progress>';
+ if(t.status)h+='<p class="mut">'+e(t.status)+'</p>';
+ if(t.results.length){const n=t.results[0].testable;
+  if(n<10)h+='<p class="warn">Only '+n+' recording(s) could be tested (a song needs at least two recordings). Too few to trust a difference — run it again after more services.</p>';
+  h+='<table><tr><th>Settings</th><th>Recognised</th><th>Wrong</th><th>Ranked first</th><th>Wrong slides caught</th><th>False alarms</th><th></th></tr>'+
+   t.results.map(r=>'<tr class="'+(r.best?'best':'')+'"><td><b>'+e(r.name)+'</b><div class="mut">'+e(summary(r.matching))+'</div></td><td>'+r.right+' / '+r.testable+'</td><td>'+r.wrong+'</td><td>'+(r.top1!=null?Math.round(r.top1*100)+'%':'–')+'</td><td>'+r.wrongSlideCaught+' / '+r.wrongSlideTests+'</td><td>'+r.falseAlarms+'</td><td>'+
+    (same(r.matching,data.saved)?'<span class="mut">in settings</span>':'<button class="link" data-m="'+e(JSON.stringify(r.matching))+'" onclick="post(\'settings\',JSON.parse(this.dataset.m)).then(()=>go(\'matching\'))">Use these</button>')+'</td></tr>').join('')+'</table>'+
+   '<p class="help">Green = most recognised with the fewest wrong suggestions. "Use these" saves them; restart to apply.</p>'}
+ return h}
+
+function clipping(){const c=data.clippingScan;
+ let h='<div class="row"><button class="primary" '+(c.busy?'disabled':'')+' onclick="post(\'clipping\')">'+(c.days?'Check again':'Check recordings')+'</button><span class="help">'+
+  (c.busy?'Checking… (each recording is measured once, then remembered)':'Shows, day by day, whether the input was too hot. A good level peaks around −6 to −3 dBFS and is never clipped.')+'</span></div>';
+ if(!c.days)return h;
+ if(!c.rows.length)return h+'<p>No recordings yet.</p>';
+ const sev=c.rows.reduce((a,r)=>(a[r.severity]++,a),[0,0,0]);
+ h+='<p><b>Total '+c.rows.length+': clean '+sev[0]+' · light '+sev[1]+' · heavy '+sev[2]+'</b></p>';
+ h+='<table class="mono"><tr><th>Day</th><th>Recs</th><th>Clean</th><th>Light</th><th>Heavy</th><th>Loudest peak</th><th>Median loudness</th></tr>'+
+  c.days.map(d=>'<tr class="'+(d.heavy?'bad':d.light?'warn':'ok')+'"><td>'+d.day+'</td><td>'+d.recordings+'</td><td>'+d.clean+'</td><td>'+d.light+'</td><td>'+d.heavy+'</td><td>'+d.loudestPeakDb.toFixed(1)+' dBFS</td><td>'+d.medianRmsDb.toFixed(1)+' dBFS</td></tr>').join('')+'</table>';
+ h+='<h3>Worst first</h3><table class="mono"><tr><th>Recording</th><th>Origin</th><th>Peak</th><th>Loudness</th><th>Clipped</th><th>Worst</th><th></th></tr>'+
+  c.rows.map(r=>'<tr class="'+({2:'bad',1:'warn'}[r.severity]||'')+'"><td>'+e(r.name)+'</td><td>'+e(r.origin)+'</td><td>'+r.peakDb.toFixed(1)+'</td><td>'+r.rmsDb.toFixed(1)+'</td><td>'+Math.round(r.clippedFraction*100)+'%</td><td>'+e(r.worst)+'</td><td>'+({2:'HEAVY',1:'light'}[r.severity]||'clean')+'</td></tr>').join('')+'</table>';
+ return h}
+
+function render(){if(!data)return;
+ if(!edit||!dirty)edit=JSON.parse(JSON.stringify(data.saved));
+ document.getElementById('tabs').innerHTML=TABS.map(([k,l])=>chip(tab===k,l,"go('"+k+"')")).join('');
+ const html={guide,matching,test,clipping}[tab]();
+ const v=document.getElementById('view');
+ if(v.dataset.html!==html){v.dataset.html=html;v.innerHTML=html}}
+async function load(){try{data=await (await fetch('/api/tuning')).json();render()}catch(_){}}
+load();setInterval(load,1500);
+</script></body></html>

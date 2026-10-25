@@ -50,4 +50,39 @@ class TakeStoreTest {
         store.deleteTake("a", 100L)
         assertEquals(listOf(200L), store.loadAll().map { it.recordedAt })
     }
+
+    @Test
+    fun `clipping survives a round trip, and old takes without it still load`() {
+        val store = TakeStore(dir, maxTakesPerSong = 5)
+        store.save(take("a", 100L).withClipped(0.25))
+        store.save(take("b", 100L))
+        assertEquals(mapOf("a" to 0.25, "b" to null), store.loadAll().associate { it.songKey to it.clipped })
+
+        // A take written before clipping was stored: the same bytes without the trailing double.
+        val oldDir = Files.createTempDirectory("old-takes").toFile()
+        val old = TakeStore(oldDir, maxTakesPerSong = 5)
+        old.save(take("a", 100L).withClipped(0.25))
+        val f = oldDir.listFiles()!!.single()
+        f.writeBytes(f.readBytes().copyOf(f.length().toInt() - 8))
+        val loaded = old.loadAll().single()
+        assertEquals(null, loaded.clipped)
+        assertEquals(3, loaded.frames.size)
+    }
+
+    @Test
+    fun `a selector decides which takes are kept`() {
+        val store = TakeStore(dir, maxTakesPerSong = 2) { all -> all.sortedBy { it.recordedAt }.take(2) }
+        listOf(100L, 200L, 300L).forEach { store.save(take("a", it)) }
+        assertEquals(listOf(100L, 200L), store.loadAll().map { it.recordedAt })
+    }
+
+    @Test
+    fun `deleteAll moves every take aside, where it can be restored from`() {
+        val store = TakeStore(dir, maxTakesPerSong = 5)
+        store.save(take("a", 1L)); store.save(take("b", 2L))
+        val trash = Files.createTempDirectory("trash").toFile()
+        store.deleteAll(trash)
+        assertTrue(store.loadAll().isEmpty())
+        assertEquals(listOf(1L, 2L), TakeStore(trash, maxTakesPerSong = 5).loadAll().map { it.recordedAt })
+    }
 }

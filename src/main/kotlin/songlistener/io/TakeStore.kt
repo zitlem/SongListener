@@ -12,7 +12,12 @@ import java.security.MessageDigest
  * One binary file per take: `<sha1(songKey)>-<recordedAt>.take` under [dir]. Takes are derived from
  * service audio, so they live only here, never in the repository.
  */
-class TakeStore(private val dir: File, private val maxTakesPerSong: Int) {
+class TakeStore(
+    private val dir: File,
+    private val maxTakesPerSong: Int,
+    /** Which of a song's takes to keep when it has too many (see `TakeSelection`); null keeps the newest. */
+    private val select: ((List<SongTake>) -> List<SongTake>)? = null,
+) {
 
     fun loadAll(): List<SongTake> =
         dir.listFiles { f -> f.name.endsWith(EXT) }.orEmpty()
@@ -20,6 +25,12 @@ class TakeStore(private val dir: File, private val maxTakesPerSong: Int) {
             .sortedBy { it.recordedAt }
 
     fun save(take: SongTake) {
+        write(take)
+        prune(take.songKey)
+    }
+
+    /** Rewrites a take in place (e.g. to add what was measured since), without pruning. */
+    fun write(take: SongTake) {
         dir.mkdirs()
         val file = File(dir, "${prefix(take.songKey)}${take.recordedAt}$EXT")
         val tmp = File(dir, file.name + ".tmp")
@@ -32,9 +43,10 @@ class TakeStore(private val dir: File, private val maxTakesPerSong: Int) {
             for (f in take.frames) for (v in f) out.writeFloat(v)
             out.writeInt(take.sectionMarks.size)
             for (m in take.sectionMarks) { out.writeInt(m.frame); out.writeInt(m.section) }
+            // Appended after the original layout, so older builds still read the file (and ignore it).
+            out.writeDouble(take.clipped ?: Double.NaN)
         }
         tmp.renameTo(file)
-        prune(take.songKey)
     }
 
     /** Deletes the one take of [songKey] recorded at [recordedAt]. */
@@ -46,8 +58,24 @@ class TakeStore(private val dir: File, private val maxTakesPerSong: Int) {
         filesFor(songKey).forEach { it.delete() }
     }
 
+    /** Moves every take into [trash] (a mistaken "forget all" can be undone by moving them back). */
+    fun deleteAll(trash: File) {
+        trash.mkdirs()
+        dir.listFiles { f -> f.name.endsWith(EXT) }.orEmpty().forEach { f ->
+            if (!f.renameTo(File(trash, f.name))) f.delete()
+        }
+    }
+
     private fun prune(songKey: String) {
-        filesFor(songKey).sortedBy { it.name }.dropLast(maxTakesPerSong).forEach { it.delete() }
+        val files = filesFor(songKey)
+        if (files.size <= maxTakesPerSong) return
+        if (select == null) {
+            files.sortedBy { it.name }.dropLast(maxTakesPerSong).forEach { it.delete() }
+            return
+        }
+        val takes = files.mapNotNull { f -> runCatching { f to read(f) }.getOrNull() }
+        val kept = select.invoke(takes.map { it.second }).map { it.recordedAt }.toSet()
+        takes.filter { it.second.recordedAt !in kept }.forEach { it.first.delete() }
     }
 
     private fun filesFor(songKey: String): List<File> {
@@ -63,7 +91,8 @@ class TakeStore(private val dir: File, private val maxTakesPerSong: Int) {
         val recordedAt = inp.readLong()
         val frames = List(inp.readInt()) { FloatArray(12) { inp.readFloat() } }
         val marks = List(inp.readInt()) { SectionMark(inp.readInt(), inp.readInt()) }
-        SongTake(key, label, recordedAt, frames, marks)
+        val clipped = if (inp.available() >= 8) inp.readDouble().takeIf { !it.isNaN() } else null
+        SongTake(key, label, recordedAt, frames, marks, clipped)
     }
 
     private companion object {

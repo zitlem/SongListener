@@ -88,12 +88,22 @@ class Recognizer(
 ) {
     private val extractor = ChromaExtractor(config, feature = config.feature)
     private val matcher = Matcher(config)
-    private val takes = initialTakes.groupBy { it.songKey }.mapValues { it.value.toMutableList() }.toMutableMap()
+    /** Takes as stored (whole), per song. */
+    private val wholeTakes = initialTakes.groupBy { it.songKey }.mapValues { it.value.toMutableList() }.toMutableMap()
+    /** What is matched on: each song's takes with their intro as [Config.introMode] says. */
+    private val takes = wholeTakes.mapValues { matchable(it.value) }.toMutableMap()
+
+    /** One song's whole takes as matched on: intro as [Config.introMode] says, then [Config.confirmedParts]. */
+    private fun matchable(whole: List<SongTake>): MutableList<SongTake> =
+        ConfirmedParts.apply(IntroFilter.applyAll(whole, config), config).toMutableList()
 
     private var recordingKey: LiveSong? = null
     private val recording = ArrayList<FloatArray>()
     private val recordingMarks = ArrayList<SectionMark>()
     private var recordingIntro = 0
+    /** Seconds of audio heard while the take records, and how many of them clipped. */
+    private var recordingChunks = 0
+    private var recordingClippedChunks = 0
 
     /** Music heard while nothing is live, oldest first; the intro of whatever goes live next. */
     private val lookback = ArrayDeque<FloatArray>()
@@ -128,17 +138,25 @@ class Recognizer(
     var state = RecognizerState()
         private set
 
-    fun takesFor(songKey: String): List<SongTake> = takes[songKey].orEmpty()
+    /** A song's takes as stored (whole, one per performance). */
+    fun takesFor(songKey: String): List<SongTake> = wholeTakes[songKey].orEmpty()
 
     /** Replaces everything learned, after a correction. */
     fun setTakes(all: List<SongTake>) {
-        takes.clear()
-        all.groupBy { it.songKey }.forEach { (k, v) -> takes[k] = v.toMutableList() }
+        takes.clear(); wholeTakes.clear()
+        all.groupBy { it.songKey }.forEach { (k, v) ->
+            wholeTakes[k] = v.toMutableList()
+            takes[k] = matchable(v)
+        }
     }
+    /** Everything matched on (intro filtered; possibly split into confirmed pieces). */
     fun allTakes(): List<SongTake> = takes.values.flatten()
+    /** Every take as stored, one per performance. */
+    fun storedTakes(): List<SongTake> = wholeTakes.values.flatten()
 
     fun forget(songKey: String) {
         takes.remove(songKey)
+        wholeTakes.remove(songKey)
     }
 
     fun onLiveSong(song: LiveSong?) {
@@ -186,6 +204,10 @@ class Recognizer(
 
     fun onAudio(samples: ShortArray) {
         val frames = extractor.push(samples)
+        if (recordingKey != null && state.isMusic) {
+            recordingChunks++
+            if (ClipDetector.analyze(samples, config.sampleRate, ClipDetector.LIVE_LEVEL).clipRuns > 0) recordingClippedChunks++
+        }
         if (state.isMusic) {
             samplesWithoutMusic = 0
             inMusic = true
@@ -252,12 +274,17 @@ class Recognizer(
         val introSeconds = seconds(recordingIntro)
         val songSeconds = seconds(recording.size - recordingIntro)
         if (song != null && recording.size - recordingIntro >= config.minTakeFrames) {
-            val take = SongTake(song.key, song.label, clock(), recording.toList(), recordingMarks.toList())
-            val list = takes.getOrPut(song.key) { mutableListOf() }
-            list += take
-            while (list.size > config.maxTakesPerSong) list.removeAt(0)
+            val clipped = if (recordingChunks > 0) recordingClippedChunks.toDouble() / recordingChunks else null
+            val take = SongTake(song.key, song.label, clock(), recording.toList(), recordingMarks.toList(), clipped)
+            val whole = wholeTakes.getOrPut(song.key) { mutableListOf() }
+            whole += take
+            if (whole.size > config.maxTakesPerSong) {
+                val kept = TakeSelection.keep(whole, config, matcher)
+                whole.clear(); whole += kept
+            }
+            takes[song.key] = matchable(whole)
             onTakeSaved(take)
-            onEvent(RecognizerEvent.TakeSaved(song, introSeconds, songSeconds, list.size, take.recordedAt))
+            onEvent(RecognizerEvent.TakeSaved(song, introSeconds, songSeconds, whole.size, take.recordedAt))
         } else if (song != null) {
             onEvent(RecognizerEvent.TakeDiscarded(song, introSeconds, songSeconds))
         }
@@ -265,6 +292,8 @@ class Recognizer(
         recording.clear()
         recordingMarks.clear()
         recordingIntro = 0
+        recordingChunks = 0
+        recordingClippedChunks = 0
         publishCounts(state.liveSong)
     }
 
