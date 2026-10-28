@@ -48,10 +48,24 @@ Java on macOS can lose keyboard focus after you switch to another app and click 
 once more inside the window.
 
 ## Web UI
-While the app runs it also serves a read-only page with the same three columns (Hearing,
-Accuracy, Learned songs) at `http://<this machine>:8780`, refreshed every second. It has no
-buttons, so anyone on the network can watch but not change anything. If the port is taken the
-web page is skipped and the app starts as usual.
+While the app runs it also serves a page with the same three columns (Hearing, Accuracy, Learned
+songs) at `http://<this machine>:8780`, refreshed every second. It has the app's controls too:
+Connect, Show it, dismiss, Forget, Review recordings (`/review`), Tuning (`/tuning`), the report
+and the logs. It asks for no password, so anyone on the network can use them. If the port is
+taken the web page is skipped and the app starts as usual.
+
+## Running headless (.62)
+On a machine with no display, run it without the window. The web page is then its only screen.
+```bash
+./gradlew headlessDist                                   # build/headless/: lib/ + bin/songlistener-headless
+rsync -a --delete build/headless/ ai@192.168.2.62:~/songlistener-app/
+ssh ai@192.168.2.62 'sudo systemctl restart songlistener'   # after an update
+```
+It needs Java 21 (`sudo apt install openjdk-21-jre-headless`) and reads the same
+`~/.songlistener/config.json`. On .62 it runs as the system unit `songlistener.service`
+(`User=ai`, enabled, so it starts on boot) with `Nice=10`, so STT's transcription comes first.
+`systemctl stop` saves the take in progress, as closing the window does. Logs:
+`journalctl -u songlistener` and `~/.songlistener/logs/` as usual.
 
 ## Running it on a service
 1. **Before:**

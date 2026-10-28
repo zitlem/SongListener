@@ -82,3 +82,26 @@ tasks.register<JavaExec>("scanClipping") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("songlistener.io.ClipScanMainKt")
 }
+
+// The app without its window, for a Linux box with no display: ./gradlew headlessDist, then copy
+// build/headless/ over and run bin/songlistener-headless (see README, "Running headless").
+val headlessDist by tasks.registering(Sync::class) {
+    group = "distribution"
+    description = "Builds build/headless/: the jars and a launcher for songlistener.io.HeadlessMainKt."
+    into(layout.buildDirectory.dir("headless"))
+    into("lib") {
+        from(tasks.jar)
+        from(configurations.runtimeClasspath)
+    }
+    into("bin") {
+        from(resources.text.fromString(
+            """
+            |#!/bin/sh
+            |# SongListener without a window. Data and settings: ~/.songlistener
+            |cd "${'$'}(dirname "${'$'}0")/.." || exit 1
+            |exec java -Xmx1g -Djava.awt.headless=true -cp 'lib/*' songlistener.io.HeadlessMainKt "${'$'}@"
+            |""".trimMargin()
+        )) { rename { "songlistener-headless" } }
+        filePermissions { unix("rwxr-xr-x") }
+    }
+}
