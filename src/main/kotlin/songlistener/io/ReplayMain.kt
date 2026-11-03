@@ -144,6 +144,7 @@ private fun overrides(c: Config): Config {
         introMatchScore = prop("introMatchScore")?.toDouble() ?: c.introMatchScore,
         confirmedParts = prop("confirmedParts")?.toBoolean() ?: c.confirmedParts,
         confirmScore = prop("confirmScore")?.toDouble() ?: c.confirmScore,
+        coarseKeep = prop("coarseKeep")?.toInt() ?: c.coarseKeep,
     )
 }
 

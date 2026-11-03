@@ -235,6 +235,72 @@ class RecognizerTest {
         assertEquals("1|A", assertNotNull(r.state.lastSuggestion).songKey)
     }
 
+    /** A plays [aSeconds] and leaves the screen; the band plays on with [after], then B goes live and is learned. */
+    private fun outroThenB(r: Recognizer, after: Recognizer.() -> Unit, next: LiveSong = songB): SongTake {
+        r.onMusicProb(1f)
+        r.onLiveSong(songA)
+        r.play(Synth.songA, 40.0, seed = 2)
+        r.onLiveSong(null)
+        r.after()
+        val held = r.state.lookbackFrames
+        r.onLiveSong(next)
+        r.play(if (next == songA) Synth.songA else Synth.songB, 35.0, seed = 4)
+        r.onLiveSong(null)
+        val take = saved.last { it.songKey == next.key }
+        assertEquals(held, take.songStart, "the slide mark stays where the song went live")
+        return take
+    }
+
+    @Test
+    fun `the last song playing on into the next is marked as its outro, not the next one's intro`() {
+        val take = outroThenB(recognizer(), {
+            play(Synth.songA, 12.0, seed = 2, start = 40.0) // A's band carries on
+            play(Synth.songB, 12.0, seed = 5)               // straight into B's own intro
+        })
+        val outro = take.outroFrames
+        assertTrue(outro in 12..36, "outro $outro frames of ~24")
+        assertEquals(listOf(SectionMark.OUTRO, SectionMark.INTRO, 0), take.sectionMarks.map { it.section })
+        val marked = events.filterIsInstance<RecognizerEvent.OutroMarked>().single()
+        assertEquals("A (#1)", marked.previousLabel)
+        // The intro reported is B's own, without A's music.
+        val started = events.filterIsInstance<RecognizerEvent.TakeStarted>().last()
+        assertEquals((take.songStart - outro) / config.featuresPerSecond, started.introSeconds, 0.01)
+        // Matching never sees it, whatever the intro mode.
+        for (mode in listOf("keep", "match", "drop")) assertEquals(0, IntroFilter.apply(take, Config(introMode = mode)).outroFrames)
+    }
+
+    @Test
+    fun `a few seconds of the last song before the next goes live are caught too`() {
+        val take = outroThenB(recognizer(), { play(Synth.songA, 3.0, seed = 2, start = 40.0) })
+        assertEquals(take.songStart, take.outroFrames, "all of it was A")
+        assertEquals(listOf(SectionMark.OUTRO, 0), take.sectionMarks.map { it.section })
+    }
+
+    @Test
+    fun `other music after a song leaves is not its outro`() {
+        val take = outroThenB(recognizer(), { play(Synth.songC, 15.0, seed = 5) })
+        assertEquals(0, take.outroFrames)
+        assertEquals(SectionMark.INTRO, take.sectionMarks.first().section)
+        assertTrue(events.none { it is RecognizerEvent.OutroMarked })
+    }
+
+    @Test
+    fun `a song coming back to the screen keeps its music as its intro`() {
+        val take = outroThenB(recognizer(), { play(Synth.songA, 12.0, seed = 2, start = 40.0) }, next = songA)
+        assertEquals(0, take.outroFrames)
+    }
+
+    @Test
+    fun `after a break the music held is the next song's, while what came before it is still the outro`() {
+        val take = outroThenB(recognizer(), {
+            play(Synth.songA, 10.0, seed = 2, start = 40.0)
+            talk(5.0)                                       // a pause, short enough to keep the look-back
+            play(Synth.songA, 12.0, seed = 6)              // the next song starts like the last one did
+        })
+        val outro = take.outroFrames
+        assertTrue(outro in 4..24, "outro $outro frames of ~20, and none after the break")
+    }
+
     @Test
     fun `learning a song is logged start to finish`() {
         val r = recognizer()

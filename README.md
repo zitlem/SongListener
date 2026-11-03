@@ -293,6 +293,15 @@ Takes are derived from service audio. They are git-ignored (`*.take`) and never 
 - The song key is `number|title`, because the live-state event carries no songbook.
 - Songs built on the same chord progression in the same order will score close together. The
   margin rule is what guards against that; watch the Accuracy panel.
-- If one song's outro runs straight into the next song going live with no break, the outro is
-  saved as the next song's intro.
-- Matching is an exhaustive search. That is fine for tens of songs; hundreds will need an index.
+- When a song leaves the screen and the band plays straight on into the next one, the music held
+  before the next slide starts with the first song's outro. Up to the first break in the music,
+  stretches that sound like the song just played (its last 30 s or another take of it), in its
+  key and tempo, and more like it than the next song, are marked as its outro (`outro_marked` in
+  the log) and never learned as the next song's intro. A song coming back to the screen keeps its
+  music as its own intro.
+- Matching searches every take in full up to `coarseKeep` songs (12; 0 = always). Beyond that a rough
+  pass on frames averaged 4 at a time ranks every song first, and only the best, plus the song on
+  screen, are searched in full, with the same scores. Measured on a laptop with drawn songs: 1000
+  takes in 1.3 s searching everything, 0.14 s with the rough pass. The Tuning page shows how long
+  searches take on the library as it is. Recognising the same *recording* (a backing track) by an
+  audio fingerprint would be faster still, but a live band never plays a song the same way twice.

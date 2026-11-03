@@ -60,6 +60,7 @@ class EventLog(private val dir: File, private val now: () -> LocalDateTime = Loc
                 put("introSeconds", round(e.introSeconds))
                 put("songSeconds", round(e.songSeconds))
             }
+            is RecognizerEvent.OutroMarked -> { song(e.song); put("previous", e.previousLabel); put("outroSeconds", round(e.outroSeconds)) }
             is RecognizerEvent.WrongSlideWarning, is RecognizerEvent.WrongSlideCleared -> wrong(e)
             is RecognizerEvent.LateSlide -> {
                 song(e.song)
@@ -76,6 +77,7 @@ class EventLog(private val dir: File, private val now: () -> LocalDateTime = Loc
                 put("decision", e.decision)
                 put("confident", e.confident)
                 put("margin", round(e.margin))
+                e.ms?.let { put("ms", Math.round(it * 10) / 10.0) }
                 putJsonArray("top") {
                     e.top.forEach { s ->
                         addJsonObject {
@@ -130,6 +132,7 @@ class EventLog(private val dir: File, private val now: () -> LocalDateTime = Loc
             is RecognizerEvent.TakeStarted -> "take_started"
             is RecognizerEvent.TakeSaved -> "take_saved"
             is RecognizerEvent.TakeDiscarded -> "take_discarded"
+            is RecognizerEvent.OutroMarked -> "outro_marked"
             is RecognizerEvent.Match -> "match"
             is RecognizerEvent.LateSlide -> "late_slide"
             is RecognizerEvent.WrongSlideWarning -> "wrong_slide_warning"

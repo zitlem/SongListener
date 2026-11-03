@@ -32,17 +32,23 @@ data class MatchResult(val ranked: List<SongScore>) {
  * Aligns a short query of chroma frames against every learned take: 12 transpositions (narrowed to
  * the [ROTATION_CANDIDATES] most likely per take), a few tempo stretches, every offset. The score
  * is the mean cosine similarity over the aligned frames, -1..1.
+ *
+ * With more than [Config.coarseKeep] songs, a rough pass first ranks every song on frames averaged
+ * [SongTake.COARSE] at a time, and only the best are searched in full. Their scores are exactly what
+ * the full search gives; the rough pass only decides which songs are searched.
  */
 class Matcher(private val config: Config = Config()) {
 
-    fun match(query: List<FloatArray>, takes: List<SongTake>): MatchResult {
+    /** [keep] is a song always searched in full, whatever the rough pass thinks: the one on screen. */
+    fun match(query: List<FloatArray>, takes: List<SongTake>, keep: String? = null): MatchResult {
         if (query.isEmpty()) return MatchResult(emptyList())
         val queryProfile = sumProfile(query)
+        val queryFlat = flatten(query)
         // Per song, the best alignment from each recording (a take may be split into pieces that
         // share its recording time; they count as one performance).
         val perRecording = HashMap<String, HashMap<Long, SongScore>>()
-        for (take in takes) {
-            val best = bestAlignment(query, queryProfile, take) ?: continue
+        for (take in shortlist(query, queryProfile, takes, keep)) {
+            val best = bestAlignment(queryFlat, query.size, queryProfile, take) ?: continue
             val byRec = perRecording.getOrPut(take.songKey) { HashMap() }
             val current = byRec[take.recordedAt]
             if (current == null || best.score > current.score) byRec[take.recordedAt] = best
@@ -63,24 +69,62 @@ class Matcher(private val config: Config = Config()) {
         return MatchResult(bestPerSong.values.sortedByDescending { it.score })
     }
 
-    internal fun bestAlignment(query: List<FloatArray>, queryProfile: FloatArray, take: SongTake): SongScore? {
-        var best: SongScore? = null
-        val rotations = if (config.transpose) candidateRotations(queryProfile, take.profile) else listOf(0)
+    /** The takes to search in full: all of them, or those of the songs the rough pass ranks best. */
+    internal fun shortlist(query: List<FloatArray>, queryProfile: FloatArray, takes: List<SongTake>, keep: String?): List<SongTake> {
+        val k = config.coarseKeep
+        if (k <= 0) return takes
+        val coarse = coarsen(query)
+        if (coarse.size < MIN_COARSE_FRAMES || takes.distinctBy { it.songKey }.size <= k) return takes
+        val coarseFlat = flatten(coarse)
+        val roughPerSong = HashMap<String, Double>()
+        for (take in takes) {
+            val n = take.coarse.size / 12
+            val best = align(coarseFlat, coarse.size, queryProfile, take.coarse, n, take.profile) ?: continue
+            roughPerSong.merge(take.songKey, best.score, ::maxOf)
+        }
+        val kept = roughPerSong.entries.sortedByDescending { it.value }.take(k).mapTo(HashSet()) { it.key }
+        keep?.let { kept += it }
+        return takes.filter { it.songKey in kept }
+    }
+
+    internal fun bestAlignment(query: List<FloatArray>, queryProfile: FloatArray, take: SongTake): SongScore? =
+        bestAlignment(flatten(query), query.size, queryProfile, take)
+
+    private fun bestAlignment(query: FloatArray, n: Int, queryProfile: FloatArray, take: SongTake): SongScore? {
+        val best = align(query, n, queryProfile, take.flat, take.frames.size, take.profile) ?: return null
+        return SongScore(take.songKey, take.songLabel, best.score, best.offset, best.rotation, best.stretch,
+            take.sectionAt(best.offset + best.span - 1))
+    }
+
+    private class Alignment(val score: Double, val offset: Int, val rotation: Int, val stretch: Double, val span: Int)
+
+    /**
+     * The best alignment of [n] query frames against [m] take frames, both laid flat. Sums in the
+     * same order as one frame's dot product at a time, so scores do not depend on the layout.
+     */
+    private fun align(query: FloatArray, n: Int, queryProfile: FloatArray, take: FloatArray, m: Int, takeProfile: FloatArray): Alignment? {
+        var best: Alignment? = null
+        val rotations = if (config.transpose) candidateRotations(queryProfile, takeProfile) else listOf(0)
+        val rotated = FloatArray(n * 12)
+        val at = IntArray(n)
         for (rotation in rotations) {
-            val rotated = query.map { rotate(it, rotation) }
+            for (i in 0 until n) for (c in 0 until 12) rotated[i * 12 + c] = query[i * 12 + Math.floorMod(c - rotation, 12)]
             for (stretch in config.tempoStretches) {
-                val span = ((query.size - 1) * stretch).roundToInt() + 1
-                if (span > take.frames.size) continue
-                for (offset in 0..take.frames.size - span) {
+                val span = ((n - 1) * stretch).roundToInt() + 1
+                if (span > m) continue
+                for (i in 0 until n) at[i] = (i * stretch).roundToInt() * 12
+                for (offset in 0..m - span) {
+                    val base = offset * 12
                     var sum = 0.0
-                    for (i in rotated.indices) {
-                        sum += dot(rotated[i], take.frames[offset + (i * stretch).roundToInt()])
+                    for (i in 0 until n) {
+                        val q = i * 12
+                        val t = base + at[i]
+                        var d = 0.0
+                        for (c in 0 until 12) d += rotated[q + c] * take[t + c]
+                        sum += d
                     }
-                    val score = sum / rotated.size
-                    if (best == null || score > best.score) {
-                        best = SongScore(take.songKey, take.songLabel, score, offset, rotation, stretch,
-                            take.sectionAt(offset + span - 1))
-                    }
+                    val score = sum / n
+                    if (best == null || score > best.score) best = Alignment(score, offset, rotation, stretch, span)
                 }
             }
         }
@@ -89,6 +133,8 @@ class Matcher(private val config: Config = Config()) {
 
     internal companion object {
         const val ROTATION_CANDIDATES = 3
+        /** A rough query shorter than this (8 s) says too little to rank by: everything is searched. */
+        const val MIN_COARSE_FRAMES = 4
 
         /**
          * The transpositions r for which the query's key profile, shifted up r semitones, best

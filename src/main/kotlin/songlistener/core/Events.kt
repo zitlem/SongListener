@@ -21,6 +21,11 @@ sealed interface RecognizerEvent {
         val takeRecordedAt: Long,
     ) : RecognizerEvent
     data class TakeDiscarded(val song: LiveSong, val introSeconds: Double, val songSeconds: Double) : RecognizerEvent
+    /**
+     * The first [outroSeconds] of the music held before [song] went live were [previousLabel] still
+     * playing on: marked as its outro, never learned as [song]'s intro.
+     */
+    data class OutroMarked(val previousLabel: String, val song: LiveSong, val outroSeconds: Double) : RecognizerEvent
 
     /**
      * One matcher run. [liveKey] is the song on screen, if any. [decision] says what came of it:
@@ -38,6 +43,8 @@ sealed interface RecognizerEvent {
         val decision: String,
         /** Which listener ran: `quick` (short window, hints) or `steady` (long window, suggestions and slide checks). */
         val window: String = "quick",
+        /** How long the search took, in milliseconds. */
+        val ms: Double? = null,
     ) : RecognizerEvent
 
     /**

@@ -221,6 +221,9 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, port
         val clipping = t.clipping.value
         return buildJsonObject {
             put("saved", matchingJson(t.savedConfig()))
+            engine.state.value.matchTiming?.let { m ->
+                put("matchTiming", buildJsonObject { put("p50", m.p50Ms); put("p95", m.p95Ms); put("runs", m.runs); put("takes", m.takes) })
+            }
             put("running", matchingJson(t.running))
             put("guide", buildJsonObject {
                 put("sttConnected", engine.stt.connected.value)

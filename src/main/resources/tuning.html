@@ -70,6 +70,8 @@ function matching(){const m=edit;let h='<p class="help">How the listener recogni
  h+='<div class="row" style="margin-top:16px"><button class="primary" '+(dirty?'':'disabled')+' onclick="post(\'settings\',edit).then(()=>{dirty=false;edit=null;render()})">Save</button>'+
   (dirty?'<button class="link" onclick="dirty=false;edit=null;render()">Undo changes</button>':'')+'<span class="'+(!dirty&&!same(data.saved,data.running)?'warn':'mut')+'">'+status+'</span></div>'+
   '<p class="help">Use "Test recognition" to see which settings recognise your recordings best before changing them.</p>';
+ const mt=data.matchTiming;
+ h+='<h3>Matching speed</h3><p class="help">'+(mt?'Each search over '+mt.takes+' takes takes '+mt.p50.toFixed(0)+' ms (95% within '+mt.p95.toFixed(0)+' ms), over the last '+mt.runs+' searches. A search runs every 2 s while music plays, twice when the long window is due; it must stay well under that.':'Measured once music has played since SongListener started.')+'</p>';
  return h}
 
 let cleanOnly=null;

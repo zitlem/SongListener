@@ -45,4 +45,23 @@ class IntroFilterTest {
         val plain = Synth.take("1|A", Synth.songA)
         assertTrue(IntroFilter.apply(plain, Config(introMode = "match")) === plain)
     }
+
+    @Test
+    fun `an outro is never kept, and never vouches for another take's intro`() {
+        val outro = Synth.chroma(Synth.render(Synth.songC, 30.0, seed = 5))
+        val body = Synth.chroma(Synth.render(Synth.songA, 90.0, seed = 6))
+        val marks = listOf(SectionMark(0, SectionMark.OUTRO), SectionMark(outro.size, 0))
+        val t = SongTake("1|A", "A", 1, outro + body, marks)
+        assertEquals(outro.size, t.outroFrames)
+        assertEquals(outro.size, t.songStart)
+        for (mode in listOf("keep", "match", "drop")) {
+            val applied = IntroFilter.apply(t, Config(introMode = mode))
+            assertEquals(body.size, applied.frames.size, mode)
+            assertEquals(listOf(SectionMark(0, 0)), applied.sectionMarks, mode)
+        }
+        // The same music held as a real intro before another performance is judged on its own:
+        // the outro elsewhere does not make it the song's.
+        val other = take(Synth.songC, 30.0)
+        assertEquals(0, IntroFilter.introFrames(IntroFilter.apply(other, Config(introMode = "match"), listOf(t))))
+    }
 }

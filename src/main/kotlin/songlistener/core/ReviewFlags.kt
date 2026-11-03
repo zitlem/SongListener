@@ -110,7 +110,7 @@ object ReviewFlags {
 
     /** Up to [WINDOWS] evenly spread windows of the song itself (after any intro). */
     internal fun windows(take: SongTake, length: Int): List<List<FloatArray>> {
-        val introEnd = take.sectionMarks.firstOrNull { it.section != SectionMark.INTRO }?.frame ?: 0
+        val introEnd = take.songStart
         val song = take.frames.drop(introEnd)
         val n = minOf(length, song.size)
         if (n < 20) return emptyList()

@@ -46,7 +46,7 @@ object ServiceImport {
         config: Config = Config(),
         searchSeconds: Double = 900.0,
     ): Pair<Double, Double>? {
-        val intro = take.sectionMarks.firstOrNull { it.section != SectionMark.INTRO }?.frame ?: 0
+        val intro = take.songStart
         val skip = 4
         val probe = take.frames.drop(intro + skip).take(60)
         if (probe.size < 20) return null

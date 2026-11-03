@@ -17,7 +17,11 @@ object IntroFilter {
     const val MIN_FRAMES = 8
 
     /** [take] as matched on; [siblings] are the song's other takes, stored whole. */
-    fun apply(take: SongTake, config: Config, siblings: List<SongTake> = emptyList()): SongTake {
+    fun apply(take: SongTake, config: Config, siblings: List<SongTake> = emptyList()): SongTake =
+        applyToSong(take.withoutOutro(), config, siblings.map { it.withoutOutro() })
+
+    /** The previous song's outro is never this song's, whatever [Config.introMode] says: it goes first. */
+    private fun applyToSong(take: SongTake, config: Config, siblings: List<SongTake>): SongTake {
         val introEnd = introFrames(take)
         if (introEnd == 0 || config.introMode == "keep") return take
         val keepFrom = if (config.introMode == "drop") introEnd else matchingStart(take, introEnd, config, siblings)
@@ -26,7 +30,7 @@ object IntroFilter {
 
     /** Every take as matched on, each judged against its song's other takes. */
     fun applyAll(takes: List<SongTake>, config: Config): List<SongTake> {
-        if (config.introMode == "keep") return takes
+        if (config.introMode == "keep") return takes.map { it.withoutOutro() }
         val bySong = takes.groupBy { it.songKey }
         return takes.map { t -> apply(t, config, bySong.getValue(t.songKey).filter { it !== t }) }
     }

@@ -52,7 +52,23 @@ data class RecognizerState(
     val cantCheckLive: Boolean = false,
     /** Seconds of music heard since the song on screen went up (the slide is judged after the steady window). */
     val secondsSinceLive: Double = 0.0,
+    /** How long matching takes on the library as it is now. */
+    val matchTiming: MatchTiming? = null,
 )
+
+/** Of the last [runs] searches (at most [MatchTiming.KEEP]), the median and 95th-percentile time, over [takes] takes. */
+data class MatchTiming(val p50Ms: Double, val p95Ms: Double, val runs: Int, val takes: Int) {
+    companion object {
+        const val KEEP = 200
+
+        fun of(ms: List<Double>, takes: Int): MatchTiming? {
+            if (ms.isEmpty()) return null
+            val sorted = ms.sorted()
+            fun at(q: Double) = sorted[minOf(sorted.size - 1, (q * sorted.size).toInt())]
+            return MatchTiming(at(0.5), at(0.95), ms.size, takes)
+        }
+    }
+}
 
 /** One line saying whether the music matches the song on screen. [kind] is `ok`, `doubt`, `wrong`, `wait` or `unknown`. */
 data class SlideCheck(val kind: String, val text: String)
@@ -104,6 +120,16 @@ class Recognizer(
     /** Seconds of audio heard while the take records, and how many of them clipped. */
     private var recordingChunks = 0
     private var recordingClippedChunks = 0
+
+    private var recordingOutro = 0
+    /** The song last recorded and the end of its music: what it would sound like playing on after it left. */
+    private var lastKey: String? = null
+    private var lastLabel: String? = null
+    private var lastTail: List<FloatArray> = emptyList()
+    /** A song just left the screen and no break has come since: what the look-back holds may be its outro. */
+    private var outroOpen = false
+    /** How many of the look-back's oldest frames were held while [outroOpen]. */
+    private var outroCandidate = 0
 
     /** Music heard while nothing is live, oldest first; the intro of whatever goes live next. */
     private val lookback = ArrayDeque<FloatArray>()
@@ -174,13 +200,20 @@ class Recognizer(
             if (song != null) {
                 recordingKey = song
                 if (previous == null && lookback.isNotEmpty()) {
-                    recordingMarks += SectionMark(0, SectionMark.INTRO)
+                    val outro = outroOf(song)
+                    recordingMarks += SectionMark(0, if (outro > 0) SectionMark.OUTRO else SectionMark.INTRO)
+                    if (outro in 1 until lookback.size) recordingMarks += SectionMark(outro, SectionMark.INTRO)
                     recording += lookback
                     recordingIntro = lookback.size
+                    recordingOutro = outro
+                    if (outro > 0) onEvent(RecognizerEvent.OutroMarked(lastLabel ?: lastKey.orEmpty(), song, seconds(outro)))
                 }
                 if (song.section != null) recordingMarks += SectionMark(recording.size, song.section)
-                onEvent(RecognizerEvent.TakeStarted(song, seconds(recordingIntro)))
+                onEvent(RecognizerEvent.TakeStarted(song, seconds(recordingIntro - recordingOutro)))
             }
+            // A song leaving the screen opens the outro window; the look-back starts empty either way.
+            outroOpen = previous != null && song == null
+            outroCandidate = 0
             lookback.clear()
             resetStreak()
             wrongKey = null; wrongStreak = 0
@@ -222,6 +255,8 @@ class Recognizer(
             inMusic = false
             // A real break breaks the query: the window must be one continuous passage.
             if (query.isNotEmpty()) onEvent(RecognizerEvent.MusicBreak(query.size))
+            // Music after a break is not the previous song playing on.
+            outroOpen = false
             query.clear()
             samplesSinceMatch = 0
             resetStreak()
@@ -230,6 +265,7 @@ class Recognizer(
             if (samplesWithoutMusic > config.lookbackMaxGapSeconds * config.sampleRate && lookback.isNotEmpty()) {
                 onEvent(RecognizerEvent.LookbackCleared(seconds(lookback.size)))
                 lookback.clear()
+                outroCandidate = 0
                 musicSince = null
             }
             // Long silence: what the panel last heard is stale.
@@ -255,7 +291,11 @@ class Recognizer(
                     onEvent(RecognizerEvent.LookbackStarted)
                 }
                 lookback.addLast(frame.chroma)
-                while (lookback.size > config.lookbackFrames) lookback.removeFirst()
+                if (outroOpen) outroCandidate++
+                while (lookback.size > config.lookbackFrames) {
+                    lookback.removeFirst()
+                    if (outroCandidate > 0) outroCandidate--
+                }
             }
         }
         samplesSinceMatch += samples.size
@@ -266,12 +306,25 @@ class Recognizer(
         }
     }
 
+    /**
+     * How many of the look-back's frames are the last song playing on into [song] (see [OutroSplit]).
+     * A song coming back to the screen is just itself, so its music is kept as its intro.
+     */
+    private fun outroOf(song: LiveSong): Int {
+        val prev = lastKey ?: return 0
+        if (prev == song.key || outroCandidate == 0) return 0
+        val tail = if (lastTail.isEmpty()) emptyList() else listOf(SongTake(prev, lastLabel ?: prev, 0, lastTail, emptyList()))
+        val previous = tail + wholeTakes[prev].orEmpty().map { it.withoutOutro() }
+        val next = wholeTakes[song.key].orEmpty().map { it.withoutOutro() }
+        return OutroSplit.boundary(lookback.toList(), outroCandidate, previous, next, config)
+    }
+
     /** Saves the take in progress, if long enough. Call on shutdown too. */
     fun finishTake() {
         val song = recordingKey
         // Only music played while the song was on screen counts toward the minimum, so a long
         // intro cannot turn a brief, mistaken go-live into a take.
-        val introSeconds = seconds(recordingIntro)
+        val introSeconds = seconds(recordingIntro - recordingOutro)
         val songSeconds = seconds(recording.size - recordingIntro)
         if (song != null && recording.size - recordingIntro >= config.minTakeFrames) {
             val clipped = if (recordingChunks > 0) recordingClippedChunks.toDouble() / recordingChunks else null
@@ -288,7 +341,13 @@ class Recognizer(
         } else if (song != null) {
             onEvent(RecognizerEvent.TakeDiscarded(song, introSeconds, songSeconds))
         }
+        if (song != null && recording.size > recordingIntro) {
+            lastKey = song.key
+            lastLabel = song.label
+            lastTail = recording.subList(maxOf(recordingIntro, recording.size - OUTRO_REFERENCE_FRAMES), recording.size).toList()
+        }
         recordingKey = null
+        recordingOutro = 0
         recording.clear()
         recordingMarks.clear()
         recordingIntro = 0
@@ -317,25 +376,38 @@ class Recognizer(
         if (takes.isEmpty()) return // nothing learned yet: no candidates, nothing to log
         matchRuns++
         val all = allTakes()
-        val quick = matcher.match(query.toList().takeLast(config.queryFrames), all)
+        val (quick, quickMs) = timed(all) { matcher.match(query.toList().takeLast(config.queryFrames), all, keep = state.liveSong?.key) }
         state = state.copy(lastMatch = quick)
         quick.best?.let { best ->
             val confident = best.score >= config.suggestScore && quick.margin >= config.suggestMargin
-            report("quick", quick, best, confident, decideQuick(best, confident))
+            report("quick", quick, best, confident, decideQuick(best, confident), quickMs)
         }
         // With no longer steady window configured, the steady checks run on the quick window.
         val single = config.steadyFrames <= config.queryFrames
         if (!single && (query.size < config.steadyFrames || matchRuns % 2 != 0)) return
-        val steady = if (single) quick else matcher.match(query.toList().takeLast(config.steadyFrames), all)
+        val (steady, steadyMs) = if (single) quick to quickMs else timed(all) { matcher.match(query.toList().takeLast(config.steadyFrames), all, keep = state.liveSong?.key) }
         state = state.copy(lastMatch = steady)
         val best = steady.best ?: return
         val confident = best.score >= config.steadyScore && steady.margin >= config.steadyMargin
-        report("steady", steady, best, confident, decideSteady(steady, best, confident))
+        report("steady", steady, best, confident, decideSteady(steady, best, confident), steadyMs)
     }
 
-    private fun report(window: String, result: MatchResult, best: SongScore, confident: Boolean, decision: String) {
+    /** The last search times, newest last: how matching keeps up as the library grows. */
+    private val matchMs = ArrayDeque<Double>()
+
+    private fun timed(all: List<SongTake>, search: () -> MatchResult): Pair<MatchResult, Double> {
+        val start = System.nanoTime()
+        val result = search()
+        val ms = (System.nanoTime() - start) / 1e6
+        matchMs.addLast(ms)
+        while (matchMs.size > MatchTiming.KEEP) matchMs.removeFirst()
+        state = state.copy(matchTiming = MatchTiming.of(matchMs.toList(), all.size))
+        return result to ms
+    }
+
+    private fun report(window: String, result: MatchResult, best: SongScore, confident: Boolean, decision: String, ms: Double? = null) {
         val live = state.liveSong
-        onEvent(RecognizerEvent.Match(live?.key, live?.section, result.ranked.take(LOGGED_CANDIDATES), result.margin, confident, decision, window))
+        onEvent(RecognizerEvent.Match(live?.key, live?.section, result.ranked.take(LOGGED_CANDIDATES), result.margin, confident, decision, window, ms))
     }
 
     /** Quick window: an early hint while nothing is live; nothing to decide while a song is. */
@@ -439,5 +511,7 @@ class Recognizer(
 
     private companion object {
         const val LOGGED_CANDIDATES = 3
+        /** How much of the end of the last song is kept to recognise it playing on (60 = 30 s). */
+        const val OUTRO_REFERENCE_FRAMES = 60
     }
 }

@@ -93,6 +93,14 @@ data class Config(
     val rehearsalHops: Int = 2,
     val rehearsalWindowMinutes: Double = 20.0,
 
+    /**
+     * Matching searches every take in full only up to this many songs. With more, a rough pass (frames
+     * averaged 4 at a time, 1/16 of the work) ranks every song first, and only the best this many,
+     * plus the song on screen, are searched in full. 0 always searches everything. Replay over 38 live
+     * recordings (2026-11-03) gave identical rows at 0, 12 and 6.
+     */
+    val coarseKeep: Int = 12,
+
     /** Seconds of audio between two matcher runs. */
     val matchIntervalSeconds: Double = 2.0,
     /** The quick listener's bar for a "sounds like…" hint. */
