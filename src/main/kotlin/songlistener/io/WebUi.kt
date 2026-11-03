@@ -133,6 +133,8 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, port
             "reviewed" -> engine.markReviewed(name, from)
             "delete" -> engine.deleteRecording(name, from)
             "relearn" -> engine.relearn(name, from)
+            "rehearsal" -> engine.markRehearsal(name, true, from)
+            "real" -> engine.markRehearsal(name, false, from)
             "relabel" -> {
                 val song = runCatching {
                     kotlinx.serialization.json.Json.parseToJsonElement(ex.requestBody.readBytes().decodeToString())
@@ -313,6 +315,8 @@ class WebUi(private val engine: ListenerEngine, private val config: Config, port
                 put("slideAt", l.goLiveSeconds)
                 put("reviewed", l.reviewed)
                 put("relearnRequested", l.relearnRequestedAt != null)
+                item.occasion?.let { put("occasion", it) }
+                put("occasionByHand", item.occasionByHand)
                 l.relabelledFrom?.let { put("relabelledFrom", songlistener.core.SongKeys.labelOf(it) ?: it) }
                 put("checked", c != null)
                 c?.introSeconds?.let { put("introSeconds", it) }

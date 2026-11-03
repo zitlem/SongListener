@@ -23,9 +23,20 @@ class SongTake(
     val sectionMarks: List<SectionMark>,
     /** Share of its seconds that clipped (input too hot), null if not measured. */
     val clipped: Double? = null,
+    /**
+     * Recorded at a rehearsal (see `RehearsalDetector`): kept until the song has a take from a real
+     * performance, then replaced by it (see `RehearsalPolicy`).
+     */
+    val rehearsal: Boolean = false,
+    /** Someone said whether this was a rehearsal; the detector never overrules them. */
+    val markedByHand: Boolean = false,
 ) {
     /** The same take with [clipped] set. */
-    fun withClipped(value: Double?) = SongTake(songKey, songLabel, recordedAt, frames, sectionMarks, value)
+    fun withClipped(value: Double?) = SongTake(songKey, songLabel, recordedAt, frames, sectionMarks, value, rehearsal, markedByHand)
+
+    /** The same take marked as a rehearsal or not; [byHand] when a person said so. */
+    fun withRehearsal(value: Boolean, byHand: Boolean = markedByHand) =
+        SongTake(songKey, songLabel, recordedAt, frames, sectionMarks, clipped, value, byHand)
 
     /** The section on screen at [frame]: the last mark at or before it, or null if there is none. */
     fun sectionAt(frame: Int): Int? = sectionMarks.lastOrNull { it.frame <= frame }?.section

@@ -29,7 +29,19 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** One recording in the review list: its file, labels, and — once checked — its flags. */
-data class ReviewItem(val name: String, val wav: File, val labels: ClipLabels, val check: ReviewCheck?)
+data class ReviewItem(
+    val name: String,
+    val wav: File,
+    val labels: ClipLabels,
+    val check: ReviewCheck?,
+    /**
+     * What became of the take learned from it: `service`, `rehearsal` (kept until the song is
+     * performed for real), `replaced` (a rehearsal a real take has since replaced), or null (none).
+     */
+    val occasion: String? = null,
+    /** Someone said whether it was a rehearsal, rather than the detector. */
+    val occasionByHand: Boolean = false,
+)
 
 /**
  * The incoming audio's level: [peakDb] of the last second (dBFS), and how many of the last
@@ -91,10 +103,20 @@ class ListenerEngine(private val dataDir: File, private val config: Config = Con
         },
         onDropped = { song, reason -> log.note("clip_dropped", "${song.label}: $reason") },
     )
+    private val rehearsal = songlistener.core.RehearsalDetector(config)
+    private val rehearsalWindowMs = (config.rehearsalWindowMinutes * 60_000).toLong()
+    /** Where rehearsal takes go once a real take replaces them (moved, not erased). */
+    private val replacedDir = File(dataDir, "deleted/rehearsal")
     private val recognizer = Recognizer(
         config, store.loadAll(),
-        onTakeSaved = { store.save(it) },
-        onEvent = { log.record(it); cutter.onEvent(it) },
+        onTakeSaved = { take ->
+            val isRehearsal = rehearsal.takeSaved(take.songKey, take.recordedAt, System.currentTimeMillis())
+            store.save(if (isRehearsal) take.withRehearsal(true) else take)
+            if (isRehearsal) log.note("take_rehearsal", "${take.songLabel} @${take.recordedAt}: songs hopped around it")
+            // After this event finishes: the recognizer is mid-way through saving it.
+            scope.launch { settle(take.songKey, reload = true) }
+        },
+        onEvent = { log.record(it); cutter.onEvent(it); onRehearsalEvent(it) },
     )
 
     /** Tuning's settings, recognition test and clipping check, shared by the app and the web page. */
@@ -142,6 +164,14 @@ class ListenerEngine(private val dataDir: File, private val config: Config = Con
             }
         }
         scope.launch { backfillTakeClipping() }
+        scope.launch {
+            // Takes kept just before a stop are settled on the next start, and every take becomes
+            // real a window after it was kept, so look again now and then.
+            while (true) {
+                settleAll()
+                kotlinx.coroutines.delay(5 * 60_000L)
+            }
+        }
         scope.launch { stt.musicProb.collect { recognizer.onMusicProb(it); publish() } }
         scope.launch {
             stt.audio.collect {
@@ -184,6 +214,74 @@ class ListenerEngine(private val dataDir: File, private val config: Config = Con
             recognizer.setTakes(store.loadAll())
         }
     }
+
+    /** Feeds the rehearsal detector; runs on [worker], inside the recognizer's event. */
+    private fun onRehearsalEvent(event: songlistener.core.RecognizerEvent) {
+        val now = System.currentTimeMillis()
+        when (event) {
+            is songlistener.core.RecognizerEvent.TakeStarted -> rehearsal.takeStarted(event.song.key, now)
+            is songlistener.core.RecognizerEvent.TakeDiscarded ->
+                rehearsal.takeDiscarded(event.songSeconds, now).forEach { ref -> scope.launch { markRehearsalLater(ref) } }
+            else -> Unit
+        }
+    }
+
+    /** Songs hopped around a take after it was kept: it was a rehearsal after all. */
+    private fun markRehearsalLater(ref: songlistener.core.RehearsalDetector.TakeRef) {
+        val take = store.takesFor(ref.songKey).firstOrNull { it.recordedAt == ref.recordedAt } ?: return
+        if (take.rehearsal || take.markedByHand) return
+        store.write(take.withRehearsal(true))
+        log.note("take_rehearsal", "${take.songLabel} @${take.recordedAt}: songs hopped around it after it was kept")
+        settle(ref.songKey, reload = true)
+    }
+
+    /**
+     * Replaces [songKey]'s rehearsal takes once it has a real one (see `RehearsalPolicy`); returns
+     * how many went. With [reload] the recognizer reloads its takes whether or not any went.
+     */
+    private fun settle(songKey: String, reload: Boolean): Int {
+        val replaced = retireRehearsals(songKey)
+        if (replaced > 0 || reload) {
+            recognizer.setTakes(store.loadAll())
+            refreshClipStats()
+            publish()
+        }
+        if (replaced > 0) refreshReview()
+        return replaced
+    }
+
+    private fun retireRehearsals(songKey: String): Int {
+        val takes = store.takesFor(songKey)
+        val gone = songlistener.core.RehearsalPolicy.toReplace(takes, System.currentTimeMillis(), rehearsalWindowMs)
+            .filter { store.retire(it.songKey, it.recordedAt, replacedDir) }
+        if (gone.isNotEmpty()) {
+            log.note("rehearsal_replaced", "${gone.first().songLabel}: ${gone.size} rehearsal take(s) replaced by a real one " +
+                gone.joinToString(prefix = "(", postfix = ")") { "@${it.recordedAt}" })
+        }
+        return gone.size
+    }
+
+    private fun settleAll() {
+        val replaced = store.loadAll().map { it.songKey }.distinct().sumOf { retireRehearsals(it) }
+        if (replaced > 0) {
+            recognizer.setTakes(store.loadAll())
+            refreshClipStats()
+            publish()
+            refreshReview()
+        }
+    }
+
+    /**
+     * Someone said whether a recording was a rehearsal. Marked real, a take a real one replaced comes
+     * back, and the song's rehearsals give way to it; marked a rehearsal, it gives way to a real one.
+     */
+    fun markRehearsal(name: String, value: Boolean, from: String = "app") =
+        correct(name, if (value) "recording_marked rehearsal" else "recording_marked real", from) { _, l ->
+            if (!value) store.restore(l.songKey, l.takeRecordedAt, replacedDir)
+            val take = store.takesFor(l.songKey).firstOrNull { it.recordedAt == l.takeRecordedAt } ?: return@correct
+            store.write(take.withRehearsal(value, byHand = true))
+            retireRehearsals(l.songKey)
+        }
 
     fun connect(churchPresenterUrl: String, apiKey: String, sttUrl: String, from: String = "app") {
         log.note("connect", "churchpresenter=$churchPresenterUrl stt=$sttUrl" + if (from != "app") " (from $from)" else "")
@@ -359,7 +457,11 @@ class ListenerEngine(private val dataDir: File, private val config: Config = Con
             try {
                 val takes = store.loadAll()
                 val signature = takes.joinToString { "${it.songKey}@${it.recordedAt}" }.hashCode()
-                val items = clipStore.labels().reversed().map { (wav, l) -> ReviewItem(wav.nameWithoutExtension, wav, l, reviewCache["$signature/${wav.name}"]) }
+                val items = clipStore.labels().reversed().map { (wav, l) ->
+                    val take = takes.firstOrNull { it.songKey == l.songKey && it.recordedAt == l.takeRecordedAt }
+                        ?: store.retired(l.songKey, l.takeRecordedAt, replacedDir)?.let { return@map item(wav, l, signature, "replaced", it.markedByHand) }
+                    item(wav, l, signature, take?.let { if (it.rehearsal) "rehearsal" else "service" }, take?.markedByHand ?: false)
+                }
                 _reviews.value = items
                 val matcher = songlistener.core.Matcher(config)
                 for (item in items) {
@@ -377,6 +479,9 @@ class ListenerEngine(private val dataDir: File, private val config: Config = Con
             }
         }
     }
+
+    private fun item(wav: File, l: ClipLabels, signature: Int, occasion: String?, byHand: Boolean) =
+        ReviewItem(wav.nameWithoutExtension, wav, l, reviewCache["$signature/${wav.name}"], occasion, byHand)
 
     /** Songs a recording can be corrected to: everything learned, plus ChurchPresenter's library. */
     suspend fun knownSongs(): List<Pair<String, String>> {

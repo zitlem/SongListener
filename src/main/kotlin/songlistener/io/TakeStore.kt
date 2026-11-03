@@ -45,6 +45,7 @@ class TakeStore(
             for (m in take.sectionMarks) { out.writeInt(m.frame); out.writeInt(m.section) }
             // Appended after the original layout, so older builds still read the file (and ignore it).
             out.writeDouble(take.clipped ?: Double.NaN)
+            out.writeByte((if (take.rehearsal) 1 else 0) or (if (take.markedByHand) 2 else 0))
         }
         tmp.renameTo(file)
     }
@@ -52,6 +53,28 @@ class TakeStore(
     /** Deletes the one take of [songKey] recorded at [recordedAt]. */
     fun deleteTake(songKey: String, recordedAt: Long) {
         filesFor(songKey).filter { it.name == "${prefix(songKey)}$recordedAt$EXT" }.forEach { it.delete() }
+    }
+
+    /** Every take of [songKey], oldest first. */
+    fun takesFor(songKey: String): List<SongTake> =
+        filesFor(songKey).mapNotNull { runCatching { read(it) }.getOrNull() }.sortedBy { it.recordedAt }
+
+    /** Moves the take of [songKey] recorded at [recordedAt] into [trash]; false if there was none. */
+    fun retire(songKey: String, recordedAt: Long, trash: File): Boolean {
+        val f = File(dir, "${prefix(songKey)}$recordedAt$EXT").takeIf { it.exists() } ?: return false
+        trash.mkdirs()
+        return f.renameTo(File(trash, f.name))
+    }
+
+    /** Reads the take of [songKey] recorded at [recordedAt] from [trash], if [retire] put it there. */
+    fun retired(songKey: String, recordedAt: Long, trash: File): SongTake? =
+        File(trash, "${prefix(songKey)}$recordedAt$EXT").takeIf { it.exists() }?.let { runCatching { read(it) }.getOrNull() }
+
+    /** Moves a [retire]d take back; false if it is not in [trash]. */
+    fun restore(songKey: String, recordedAt: Long, trash: File): Boolean {
+        val f = File(trash, "${prefix(songKey)}$recordedAt$EXT").takeIf { it.exists() } ?: return false
+        dir.mkdirs()
+        return f.renameTo(File(dir, f.name))
     }
 
     fun delete(songKey: String) {
@@ -92,7 +115,8 @@ class TakeStore(
         val frames = List(inp.readInt()) { FloatArray(12) { inp.readFloat() } }
         val marks = List(inp.readInt()) { SectionMark(inp.readInt(), inp.readInt()) }
         val clipped = if (inp.available() >= 8) inp.readDouble().takeIf { !it.isNaN() } else null
-        SongTake(key, label, recordedAt, frames, marks, clipped)
+        val occasion = if (inp.available() >= 1) inp.readByte().toInt() else 0
+        SongTake(key, label, recordedAt, frames, marks, clipped, rehearsal = occasion and 1 != 0, markedByHand = occasion and 2 != 0)
     }
 
     private companion object {

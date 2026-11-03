@@ -32,6 +32,13 @@ class TakeSelectionTest {
     }
 
     @Test
+    fun `rehearsal takes are dropped first, whichever takes are kept`() {
+        val all = listOf(take(1), take(2), take(3), take(4).withRehearsal(true), take(5).withRehearsal(true))
+        assertEquals(listOf(1L, 2L, 3L), TakeSelection.keep(all, config).map { it.recordedAt })
+        assertEquals(listOf(1L, 2L, 3L), TakeSelection.keep(all, config.copy(keepTakes = "best")).map { it.recordedAt })
+    }
+
+    @Test
     fun `a song's score can lean on its second-best take`() {
         val good = Synth.take("A", Synth.songA)
         val odd = SongTake("A", "A", 1, Synth.take("A", Synth.songC).frames, emptyList())

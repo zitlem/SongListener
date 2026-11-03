@@ -82,6 +82,17 @@ data class Config(
      */
     val confirmScore: Double = 0.65,
 
+    /**
+     * Rehearsal detection (see `RehearsalDetector`): a take is a rehearsal when at least
+     * [rehearsalHops] songs went up with music and came down too soon to keep (under
+     * [minTakeFrames]) within [rehearsalWindowMinutes] before it started or after it ended. At a
+     * rehearsal the operator jumps between the songs being practised; during a service each song
+     * goes up once. Chosen on 2026-10-28 and 2026-11-01 (two rehearsals, three services): 31 of 33
+     * takes sorted right, the two misses rehearsal takes at the tail end of one, where hops thinned out.
+     */
+    val rehearsalHops: Int = 2,
+    val rehearsalWindowMinutes: Double = 20.0,
+
     /** Seconds of audio between two matcher runs. */
     val matchIntervalSeconds: Double = 2.0,
     /** The quick listener's bar for a "sounds like…" hint. */

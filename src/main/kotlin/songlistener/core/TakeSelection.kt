@@ -1,7 +1,8 @@
 package songlistener.core
 
 /**
- * Which of a song's takes to keep once it has more than [Config.maxTakesPerSong]. `newest` keeps
+ * Which of a song's takes to keep once it has more than [Config.maxTakesPerSong]. Rehearsal takes
+ * are dropped before any other (see `RehearsalPolicy`). After that, `newest` keeps
  * the latest. `best` keeps unclipped takes over clipped ones, then the takes that agree most with
  * the song's others (one that sounds unlike the rest was likely a wrong slide or a bad night),
  * then the newest — so a good old take is not pushed out just by being old.
@@ -11,10 +12,15 @@ object TakeSelection {
     fun keep(takes: List<SongTake>, config: Config, matcher: Matcher = Matcher(config)): List<SongTake> {
         val sorted = takes.sortedBy { it.recordedAt }
         if (sorted.size <= config.maxTakesPerSong) return sorted
-        if (config.keepTakes != "best") return sorted.takeLast(config.maxTakesPerSong)
+        // Rehearsal takes go first either way: a real performance is what should be remembered.
+        if (config.keepTakes != "best") {
+            return sorted.sortedWith(compareBy<SongTake> { if (it.rehearsal) 1 else 0 }.thenByDescending { it.recordedAt })
+                .take(config.maxTakesPerSong).sortedBy { it.recordedAt }
+        }
         val agreement = sorted.associateWith { agreement(it, sorted, matcher, config) ?: 0.0 }
         return sorted.sortedWith(
-            compareBy<SongTake> { if (heavilyClipped(it, config)) 1 else 0 }
+            compareBy<SongTake> { if (it.rehearsal) 1 else 0 }
+                .thenBy { if (heavilyClipped(it, config)) 1 else 0 }
                 .thenByDescending { agreement.getValue(it) }
                 .thenByDescending { it.recordedAt },
         ).take(config.maxTakesPerSong).sortedBy { it.recordedAt }

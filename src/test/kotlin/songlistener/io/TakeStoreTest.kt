@@ -6,6 +6,7 @@ import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class TakeStoreTest {
@@ -29,6 +30,35 @@ class TakeStoreTest {
         assertEquals(3, loaded.frames.size)
         assertContentEquals(take("x", 0).frames[2], loaded.frames[2])
         assertEquals(listOf(SectionMark(0, 0), SectionMark(2, 1)), loaded.sectionMarks)
+    }
+
+    @Test
+    fun `whether a take was a rehearsal survives a round trip, and old files read as not`() {
+        val store = TakeStore(dir, maxTakesPerSong = 5)
+        store.save(take("a", 1L).withRehearsal(true))
+        store.save(take("a", 2L).withRehearsal(false, byHand = true))
+        store.save(take("a", 3L))
+        assertEquals(
+            listOf(Triple(1L, true, false), Triple(2L, false, true), Triple(3L, false, false)),
+            store.takesFor("a").map { Triple(it.recordedAt, it.rehearsal, it.markedByHand) },
+        )
+        // A file from before the flag existed ends after the clipping value.
+        val f = dir.listFiles()!!.first { it.name.endsWith("-3.take") }
+        f.writeBytes(f.readBytes().copyOf(f.length().toInt() - 1))
+        assertFalse(store.takesFor("a").last().rehearsal)
+    }
+
+    @Test
+    fun `a retired take leaves the song and can be brought back`() {
+        val store = TakeStore(dir, maxTakesPerSong = 5)
+        val trash = Files.createTempDirectory("rehearsal").toFile()
+        store.save(take("a", 1L).withRehearsal(true)); store.save(take("a", 2L))
+        assertTrue(store.retire("a", 1L, trash))
+        assertEquals(listOf(2L), store.takesFor("a").map { it.recordedAt })
+        assertTrue(store.retired("a", 1L, trash)!!.rehearsal)
+        assertTrue(store.restore("a", 1L, trash))
+        assertEquals(listOf(1L, 2L), store.takesFor("a").map { it.recordedAt })
+        assertFalse(store.retire("a", 99L, trash))
     }
 
     @Test

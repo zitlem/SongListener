@@ -27,6 +27,12 @@ changes neither of them.
   shown as "Band is at: section 3" or "intro". Only parts with different music can be told apart:
   when every verse of a hymn has the same tune, it can tell intro from verse (and from a chorus
   with its own tune) but not verse 1 from verse 3.
+- **Rehearsals:** a take is marked as a rehearsal when at least 2 songs went up with music and came
+  down too soon to keep within 20 min of it — at a rehearsal the operator jumps between the songs
+  being practised; during a service each goes up once. (The music cannot tell them apart: a band
+  rehearses at the tempo it plays.) A rehearsal take is used until its song has a real take that has
+  stood for 20 min, then it is moved to `~/.songlistener/deleted/rehearsal/`. The review page's
+  "Rehearsal" and "It was real" buttons overrule the detector.
 - **Accuracy:** while a song that already has takes is on screen, it scores what it would have
   predicted, so one service gives you a hit rate.
 

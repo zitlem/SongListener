@@ -33,14 +33,14 @@ function render(){
   document.getElementById('help').textContent={
    flagged:'These may have had the wrong song on screen. Play the recording ("Play from slide" jumps to where the slide went up). If the song is right press "Looks right"; if not, press the suggested song or "It\'s another song…" and it is relearned as that song. "Delete" removes a recording that is no use (moved to the deleted folder, not erased).',
    clipped:'Recorded while the input was too hot. Listen at the "worst at" time to hear it. Once the gain is fixed and the song has been recorded cleanly, "Relearn" forgets what a clipped recording taught (the recording is kept) so the song is learned again from clean audio.',
-   all:'Every recording, newest first. "Play intro" plays the music held before the slide went up, which was learned as the intro.'}[show];
+   all:'Every recording, newest first. "Play intro" plays the music held before the slide went up, which was learned as the intro. "Rehearsal" marks one recorded at a rehearsal: it is kept until the song is performed for real, then replaced. Takes are marked as rehearsals by themselves when songs were hopped between around them; "It was real" undoes it.'}[show];
   const pending=clipped.filter(r=>!r.relearnRequested);
   const ra=document.getElementById('relearnAll');ra.style.display=show=='clipped'&&pending.length?'':'none';ra.textContent='Relearn all '+pending.length+' clipped';
   const rows=({flagged,clipped,all:data}[show]).slice().sort((a,b)=>((b.reviewed?-1:b.severity)-(a.reviewed?-1:a.severity))||b.startedAt-a.startedAt);
   document.getElementById('list').innerHTML=rows.length?rows.map(r=>`
    <div class="rec ${r.reviewed?'done':'s'+r.severity}" data-name="${esc(r.name)}">
     <div class=title>${esc(r.song)}</div>
-    <div class="meta muted">${fmt(r.startedAt)} · ${esc(r.origin)} · ${Math.round(r.seconds)} s · slide up at ${Math.round(r.slideAt)} s${r.relabelledFrom?' · corrected from '+esc(r.relabelledFrom):''}${r.reviewed?' · ✓ reviewed':''}${r.introSeconds?` · intro ${Math.round(r.introSeconds)} s (${Math.round(r.introMatchedSeconds)} s like the song)`:''}</div>
+    <div class="meta muted">${fmt(r.startedAt)} · ${esc(r.origin)} · ${Math.round(r.seconds)} s · slide up at ${Math.round(r.slideAt)} s${r.relabelledFrom?' · corrected from '+esc(r.relabelledFrom):''}${r.reviewed?' · ✓ reviewed':''}${occ(r)}${r.introSeconds?` · intro ${Math.round(r.introSeconds)} s (${Math.round(r.introMatchedSeconds)} s like the song)`:''}</div>
     ${r.checked?r.flags.map(f=>`<div class="flag s${f.severity}">⚑ ${esc(f.text)}</div>`).join(''):'<div class=muted>Checking…</div>'}
     <audio controls preload=none src="${q('/audio/'+encodeURIComponent(r.name))}"></audio>
     <div class=actions>
@@ -49,10 +49,13 @@ function render(){
       ${r.reviewed?'':'<button onclick="act(this,\'reviewed\')">Looks right</button>'}
       ${r.rivalKey&&r.rivalScore>=0.7?`<button class=primary data-k="${esc(r.rivalKey)}" onclick="relabel(this,this.dataset.k)">It's ${esc(r.rivalLabel)}</button>`:''}
       ${r.flags.some(f=>f.code=='clipped')&&!r.relearnRequested?'<button onclick="relearn(this)" title="Forget what was learned from this recording (it is kept); the song is learned again the next time it is played">Relearn (too hot)</button>':''}
+      ${r.occasion=='service'?'<button onclick="act(this,\'rehearsal\')" title="Recorded at a rehearsal: kept until the song is performed for real, then replaced">Rehearsal</button>':''}
+      ${r.occasion=='rehearsal'||r.occasion=='replaced'?'<button onclick="act(this,\'real\')" title="This was the real performance: keep it, and let the song\'s rehearsal takes go">It was real</button>':''}
       <button onclick="pick(this)">It's another song…</button>
       <button class=danger onclick="del(this)">Delete</button>
     </div><div class=picker></div></div>`).join(''):(show=='clipped'?'<p class=muted>No clipped recordings'+(data.some(r=>!r.checked)?' found yet — still checking.':'.')+'</p>':'<p class=muted>Nothing needs a listen.</p>');
 }
+function occ(r){const h=r.occasionByHand?' (marked)':'';return {rehearsal:' · <span class=flag>rehearsal'+h+' — replaced once the song is performed for real</span>',replaced:' · rehearsal'+h+', replaced by a real performance'}[r.occasion]||''}
 const nameOf=b=>b.closest('.rec').dataset.name;
 function seek(b,t){const a=b.closest('.rec').querySelector('audio');a.currentTime=t;a.play()}
 async function post(name,action,body){await fetch(q('/api/recordings/'+encodeURIComponent(name)+'/'+action),{method:'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):''});setTimeout(load,800)}
